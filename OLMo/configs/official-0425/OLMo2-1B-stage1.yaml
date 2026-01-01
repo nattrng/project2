@@ -73,6 +73,8 @@ tokenizer:
 save_folder: http://olmo-data.org/checkpoints/OLMo-small/${run_name}
 save_overwrite: false
 
+surrogate_model_name = 'Qwen/Qwen3-0.6B'
+
 save_interval: 1000
 save_interval_ephemeral: 1000
 save_num_checkpoints_to_keep: 0
