@@ -68,18 +68,6 @@ __all__ = ["SpeedMonitor", "LRMonitor", "Trainer"]
 
 log = logging.getLogger(__name__)
 
-surrogate_model = AutoModelForCausalLM.from_pretrained('openai-community/gpt2', dtype=torch.float16)
-surrogate_model.eval()
-
-surrogate_tokenizer = AutoTokenizer.from_pretrained('openai-community/gpt2')
-if surrogate_tokenizer.pad_token is None:
-    surrogate_tokenizer.pad_token = surrogate_tokenizer.eos_token
-    surrogate_model.config.pad_token_id = surrogate_tokenizer.eos_token_id
-
-config = TrainConfig.load('/Users/nathan/Documents/Development/project2/OLMo/configs/official-0425/OLMo2-1B-stage1.yaml') #trainconfig class inherits from baseconfig which possesses the load func for yamls.
-tokenizer = Tokenizer.from_train_config(config=config) #this class method returns a tokenizer btw. 
-
-
 @dataclass
 class SpeedMonitor:
     cfg: SpeedMonitorConfig
@@ -135,7 +123,6 @@ class LRMonitor:
     def check(self) -> Dict[str, float]:
         lrs = [group["lr"] for group in self.optim.param_groups]
         return {f"optim/learning_rate_group{idx}": lr for idx, lr in enumerate(lrs)}
-
 
 
 
@@ -205,6 +192,7 @@ class Trainer:
     cfg: TrainConfig
     model: OLMo
     dist_model: Union[DDP, FSDP, SingleAccelerator]
+    surrogate_model_name: str
     optim: Optimizer
     scheduler: Scheduler
     train_loader: DataLoader
@@ -235,6 +223,16 @@ class Trainer:
                 self.loss_fn = fused_loss_fn
             else:
                 raise NameError("`fused_loss_fn` is not defined. Please ensure that `flash_attn` is installed.")
+            
+        self.surrogate_model = AutoModelForCausalLM.from_pretrained('openai-community/gpt2', dtype=torch.float16)
+        self.surrogate_model.to(self.device).eval()
+        
+        self.surrogate_tokenizer = AutoTokenizer.from_pretrained('openai-community/gpt2', padding_side='left') #left bc we are performing "inference". we do not wish for the last token seen to be padding. push it to the rgiht
+        if surrogate_tokenizer.pad_token is None:
+            surrogate_tokenizer.pad_token = surrogate_tokenizer.eos_token
+            surrogate_model.config.pad_token_id = surrogate_tokenizer.eos_token_id
+
+        self.tokenizer = Tokenizer.from_train_config(config=self.cfg)
 
     @property
     def dataset(self) -> IterableDataset:
@@ -741,17 +739,17 @@ class Trainer:
         if k is not 0:
             with torch.no_grad():
                 input_ids = batch["input_ids"]
-                batch_size, seq_len = input_ids.shape
                 batch_strings = tokenizer.base_tokenizer.decode_batch(input_ids, skip_special_tokens=True) #skip. im sure they already have special tokens in the vocab.
-                surrogate_batch_encodings = surrogate_model(**surrogate_tokenizer.encode_batch(batch_strings), padding=True, padding_side='left') #left bc we are performing "inference". we do not wish for the last token seen to be padding. push it to the rgiht
+                surrogate_batch_encodings = surrogate_tokenizer(batch_strings, padding=True, return_tensors='pt') 
 
                 surrogate_labels = self.get_labels(batch) # (should be (batch, seq))
+                surrogate_labels.to(self.device)
                 flattened_labels = surrogate_labels.view(-1).tolist()
                 formatted = [[label] for label in flattened_labels]
                 # should still be (batch_size, seq_len)
                 label_strings = tokenizer.base_tokenizer.decode_batch(formatted, skip_special_tokens=False)
                 surrogate_label_encodings = surrogate_tokenizer(label_strings, add_special_tokens=False)    
-                mask = torch.tensor([len(token_ids) != 1 for token_ids in surrogate_label_encodings], device=surrogate_labels.device, dtype=torch.bool).view(surrogate_labels.shape)
+                mask = torch.tensor([len(token_ids) != 1 for token_ids in surrogate_label_encodings['input_ids']], device=surrogate_labels.device, dtype=torch.bool).view(surrogate_labels.shape)
                 surrogate_labels[mask] = -100
                 #the label masking gets rid of the padding issue in the tokenizer instantiation. i think. the padding would likely get split when encoded
             
