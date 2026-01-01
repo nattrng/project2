@@ -224,13 +224,13 @@ class Trainer:
             else:
                 raise NameError("`fused_loss_fn` is not defined. Please ensure that `flash_attn` is installed.")
             
-        self.surrogate_model = AutoModelForCausalLM.from_pretrained('openai-community/gpt2', dtype=torch.float16)
+        self.surrogate_model = AutoModelForCausalLM.from_pretrained(self.surrogate_model_name, dtype=torch.float16)
         self.surrogate_model.to(self.device).eval()
         
-        self.surrogate_tokenizer = AutoTokenizer.from_pretrained('openai-community/gpt2', padding_side='left') #left bc we are performing "inference". we do not wish for the last token seen to be padding. push it to the rgiht
-        if surrogate_tokenizer.pad_token is None:
-            surrogate_tokenizer.pad_token = surrogate_tokenizer.eos_token
-            surrogate_model.config.pad_token_id = surrogate_tokenizer.eos_token_id
+        self.surrogate_tokenizer = AutoTokenizer.from_pretrained(self.surrogate_model_name, padding_side='left') #left bc we are performing "inference". we do not wish for the last token seen to be padding. push it to the rgiht
+        if self.surrogate_tokenizer.pad_token is None:
+            self.surrogate_tokenizer.pad_token = self.surrogate_tokenizer.eos_token
+            self.surrogate_model.config.pad_token_id = self.surrogate_tokenizer.eos_token_id
 
         self.tokenizer = Tokenizer.from_train_config(config=self.cfg)
 
@@ -722,10 +722,9 @@ class Trainer:
         return labels[..., 1:].contiguous()
 
     def model_forward(
-        self, tokenizer, batch: Dict[str, Any], loss_reduction: str = "mean", compute_z_loss: bool = False, k: int = 0
+        self, batch: Dict[str, Any], loss_reduction: str = "mean", compute_z_loss: bool = False, k: int = 0
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         
-        global surrogate_model, surrogate_tokenizer
 
         # shape: (batch_size, seq_len, vocab_size)
         logits = self.dist_model(
@@ -739,21 +738,20 @@ class Trainer:
         if k is not 0:
             with torch.no_grad():
                 input_ids = batch["input_ids"]
-                batch_strings = tokenizer.base_tokenizer.decode_batch(input_ids, skip_special_tokens=True) #skip. im sure they already have special tokens in the vocab.
-                surrogate_batch_encodings = surrogate_tokenizer(batch_strings, padding=True, return_tensors='pt') 
+                batch_strings = self.tokenizer.base_tokenizer.decode_batch(input_ids, skip_special_tokens=True) #skip. im sure they already have special tokens in the vocab.
+                surrogate_batch_encodings = (self.surrogate_tokenizer(batch_strings, padding=True, return_tensors='pt')).to(self.device)
 
                 surrogate_labels = self.get_labels(batch) # (should be (batch, seq))
-                surrogate_labels.to(self.device)
-                flattened_labels = surrogate_labels.view(-1).tolist()
+                flattened_labels = surrogate_labels.view(-1).tolist() #should still be on device. 
                 formatted = [[label] for label in flattened_labels]
                 # should still be (batch_size, seq_len)
-                label_strings = tokenizer.base_tokenizer.decode_batch(formatted, skip_special_tokens=False)
-                surrogate_label_encodings = surrogate_tokenizer(label_strings, add_special_tokens=False)    
+                label_strings = self.tokenizer.base_tokenizer.decode_batch(formatted, skip_special_tokens=False)
+                surrogate_label_encodings = self.surrogate_tokenizer(label_strings, add_special_tokens=False)    
                 mask = torch.tensor([len(token_ids) != 1 for token_ids in surrogate_label_encodings['input_ids']], device=surrogate_labels.device, dtype=torch.bool).view(surrogate_labels.shape)
                 surrogate_labels[mask] = -100
                 #the label masking gets rid of the padding issue in the tokenizer instantiation. i think. the padding would likely get split when encoded
             
-                outputs = surrogate_model(**surrogate_batch_encodings, labels=surrogate_labels)
+                outputs = self.surrogate_model(**surrogate_batch_encodings, labels=surrogate_labels)
                 del surrogate_labels, flattened_labels, label_strings, surrogate_label_encodings, mask # i'll see if this helps.
                 logits = outputs.logits # should be (batch, seq_len, |vocab|)
 
