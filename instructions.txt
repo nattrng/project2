@@ -1,0 +1,12 @@
+run the following to download the dataset:
+
+huggingface-cli download EleutherAI/pile-deduped-pythia-preshuffled --repo-type dataset --local-dir ./pythia_data
+
+EleutherAI/pile-deduped-pythia-preshuffled-validation
+
+concat using the following:
+
+ls -lh pythia_data/document.bin
+
+
+for gpu faiss, pip install faiss-gpu (assuming cuda is available) else pip install faiss-cpu (faiss does not support mlx)
