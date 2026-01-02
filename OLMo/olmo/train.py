@@ -735,7 +735,7 @@ class Trainer:
             max_doc_lens=batch.get("max_doc_lens"),
         ).logits
 
-        if k is not 0:
+        if k != 0:
             with torch.no_grad():
                 input_ids = batch["input_ids"]
                 batch_strings = self.tokenizer.base_tokenizer.decode_batch(input_ids, skip_special_tokens=True) #skip. im sure they already have special tokens in the vocab.
