@@ -224,7 +224,7 @@ class Trainer:
             else:
                 raise NameError("`fused_loss_fn` is not defined. Please ensure that `flash_attn` is installed.")
             
-        self.surrogate_model = AutoModelForCausalLM.from_pretrained(self.surrogate_model_name, dtype=torch.float16)
+        self.surrogate_model = AutoModelForCausalLM.from_pretrained(self.surrogate_model_name, torch_dtype=torch.float16)
         self.surrogate_model.to(self.device).eval()
         
         self.surrogate_tokenizer = AutoTokenizer.from_pretrained(self.surrogate_model_name, padding_side='left') #left bc we are performing "inference". we do not wish for the last token seen to be padding. push it to the rgiht
@@ -233,6 +233,15 @@ class Trainer:
             self.surrogate_model.config.pad_token_id = self.surrogate_tokenizer.eos_token_id
 
         self.tokenizer = Tokenizer.from_train_config(config=self.cfg)
+
+        # can be done either way, self tokenizer to surrogate or surrogate to self
+        tokenizer_token_set = set(self.tokenizer.base_tokenizer.get_vocab().keys())
+        surrogate_tokenizer_token_set = set(self.surrogate_tokenizer.get_vocab().keys())
+        intersection = tokenizer_token_set.intersection(surrogate_tokenizer_token_set) 
+        encoded_intersection = self.tokenizer.base_tokenizer.convert_tokens_to_ids(list(intersection)) #turns intersection set of strs to list of strs
+        self.permitted_tokens = torch.tensor(encoded_intersection)
+
+
 
     @property
     def dataset(self) -> IterableDataset:
@@ -735,55 +744,56 @@ class Trainer:
             max_doc_lens=batch.get("max_doc_lens"),
         ).logits
 
+        labels = self.get_labels(batch) #preshifted with get_labels func.
+
         if k != 0:
             with torch.no_grad():
                 input_ids = batch["input_ids"]
                 batch_strings = self.tokenizer.base_tokenizer.decode_batch(input_ids, skip_special_tokens=True) #skip. im sure they already have special tokens in the vocab.
-                surrogate_batch_encodings = (self.surrogate_tokenizer(batch_strings, padding=True, return_tensors='pt')).to(self.device)
+                surrogate_batch_encodings = (self.surrogate_tokenizer(batch_strings, padding=True, return_tensors='pt')).to(self.device) #pad to ensure seq_len remains the same.
 
-                surrogate_labels = self.get_labels(batch) # (should be (batch, seq))
-                flattened_labels = surrogate_labels.view(-1).tolist() #should still be on device. 
-                formatted = [[label] for label in flattened_labels]
-                # should still be (batch_size, seq_len)
-                label_strings = self.tokenizer.base_tokenizer.decode_batch(formatted, skip_special_tokens=False)
-                surrogate_label_encodings = self.surrogate_tokenizer(label_strings, add_special_tokens=False)    
-                mask = torch.tensor([len(token_ids) != 1 for token_ids in surrogate_label_encodings['input_ids']], device=surrogate_labels.device, dtype=torch.bool).view(surrogate_labels.shape)
-                surrogate_labels[mask] = -100
-                #the label masking gets rid of the padding issue in the tokenizer instantiation. i think. the padding would likely get split when encoded
-            
-                outputs = self.surrogate_model(**surrogate_batch_encodings, labels=surrogate_labels)
-                del surrogate_labels, flattened_labels, label_strings, surrogate_label_encodings, mask # i'll see if this helps.
-                logits = outputs.logits # should be (batch, seq_len, |vocab|)
+                outputs = self.surrogate_model(**surrogate_batch_encodings)
+                surrogate_logits = (outputs.logits)[..., :-1, :].contiguous() # should be (batch, seq_len-1, |vocab|) due to olmo's shift. their seq_len is diff though bc of different tokenizer. had to 
+                surr_batch_size, surr_seq_len, surr_vocab_size = surrogate_logits.shape #seq_len should be originnal seq_len - 1 due to shift.
 
-                #we want to calculate hte perplexities across rows. 
-                surrogate_perp = torch.reciprocal(F.softmax(logits, dim=-1) + 2e-6) # now rank using torch.topk or python sorted func. this is numerically the same.
-                btc, seq = (surrogate_perp.shape)[0], (surrogate_perp.shape)[1]
+
+
+                #we want to calculate hte perplexities across rows.  
+                surrogate_perp = torch.reciprocal(F.softmax(surrogate_logits, dim=-1) + 1e-8) # now rank using torch.topk or python sorted func. this is numerically the same. calcs per-token perplexity, not sequence.
                 labels = self.get_labels(batch)
-                for b in range(btc):
-                    for s in range(seq):
-                        surrogate_perp[b, s, labels[b, s]] = float('inf')
-                
-            topk = torch.topk(surrogate_perp, largest=False, sorted=True, dim=-1) # k is relative per row. might have to perform masking then topk | for now, we can just set k = to some arbitrary value.
+                surrogate_perp.scatter_(dim=2, index=labels.unsqueeze(-1), value=float('inf'))
+                # for b in range(surr_batch_size):
+                #     for s in range(surr_seq_len):
+                #         surrogate_perp[b, s, labels[b, s]] = float('inf')
+                #surrogate_perp should be (batch_size, seq_len, vocab). should do masking here. alright. for those not in set, set to float('inf') I GOT IT
+                vocab_idx = torch.arange(start=0, end=surr_vocab_size, device=self.device)
+                mask = ~torch.isin(vocab_idx, self.permitted_tokens) # true = not in. 
+                surrogate_perp.masked_fill_(mask, float('inf'))
+
+
+            topk = torch.topk(surrogate_perp, k=k, largest=False, sorted=True, dim=-1) # k is relative per row. might have to perform masking then topk | for now, we can just set k = to some arbitrary value.
             # perp_values = topk.values  #(batch, seq_len, |vocab|) | dont need i think, we only need indices. could be useful for vis or analysis.
  
             perp_indices = topk.indices #(batch, seq_len, k (4 in this initial scenario))
-            surrogate_ce_tensor = torch.cat([-torch.log(F.softmax(logits[b, s, [s, perp_indices[b, s]]], dim=-1)) * F.softmax(-torch.log(F.softmax(-(logits[b, s, [s, perp_indices[b, s]]]), dim=-1)), dim=-1) for s in range(seq) for b in range(btc)]) 
+            
+            # # we want surrogate_ce_tensor to be (batch_size, , 1). where the 1 value is the aggregated perplexities for that seq. 
+
+            # surrogate_ce_tensor = torch.cat([-torch.log(F.softmax(logits[b, s, [s, filtered_perp_indices[b, s]]], dim=-1)) * F.softmax(-torch.log(F.softmax(-(logits[b, s, [s, filtered_perp_indices[b, s]]]), dim=-1)), dim=-1) for s in range(surr_seq_len) for b in range(surr_batch_size)]) # calc perplexity via exp(-log(probs)) | issue: they are alld isconnected. they have to be added elementwise.
             # for b in range(btc):
             #     for s in range(seq):
             #         logits[b, s, [s, perp_indices[b, s]]]#gets a row of 4 indices
-
-
-
-
-        logits_for_loss = logits[..., :-1, :].contiguous() 
+        else:
+            perp_indices = None
+        
+        logits_for_loss = logits[..., :-1, :].contiguous()
         # shape: (batch_size * seq_len, vocab_size)
         logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
         # shape: (batch_size, seq_len)
-        # labels = self.get_labels(batch) |already defined above
+        labels = self.get_labels(batch) 
         # shape: (batch_size * seq_len,)
         labels = labels.view(-1)
         ce_loss, z_loss = self.loss_fn(
-            logits=logits_for_loss, labels=labels, weighted_perp_loss_tensor=surrogate_ce_tensor, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
+            logits=logits_for_loss, labels=labels, perp_indices=perp_indices, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
         )
         if loss_reduction == "none":
             # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
