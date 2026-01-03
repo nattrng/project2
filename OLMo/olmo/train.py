@@ -137,7 +137,8 @@ try:
     def fused_loss_fn(
         logits,
         labels,
-        weighted_perp_loss_tensor,
+        perp_values: torch.Tensor = None,
+        perp_indices: torch.Tensor = None,
         ignore_index: int = -100,
         reduction: str = "mean",
         compute_z_loss: bool = False,
@@ -164,24 +165,55 @@ try:
 
         mask = labels != ignore_index
 
-        if reduction == "mean":
-            loss = (loss.sum() + weighted_perp_loss_tensor.sum()) / (mask.sum() + len(weighted_perp_loss_tensor))
-        elif reduction == "sum":
-            loss = loss.sum() + weighted_perp_loss_tensor.sum()
+        if perp_indices is not None:
+            batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
+            k = (perp_indices.shape)[-1] #grabs last dim which is k.
+            gathered_logits = torch.gather(logits, dim=2, index=perp_indices)
+            gathered_logits_probs = F.softmax(gathered_logits, dim=-1)
+            gathered_nll = -torch.log(gathered_logits_probs) # (batch_len, seq_len, k)
+            weighted_loss_tensor = gathered_nll * F.softmax(-perp_values, dim=-1) 
+            surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) #(batch_len, seq_len) keepdim should be false automatically.
+            
+
+            if reduction == "mean":
+                loss = (loss.sum() + surr_loss_term.sum()) / (mask.sum()+ (batch_size*seq_len*k))
+            elif reduction == "sum":
+                loss = loss.sum() + surr_loss_term
+            else:
+                loss = loss
+
+            if not compute_z_loss:
+                return loss, None
+
+            if reduction == "mean": # i will ignore z loss for now. 
+                z_loss = z_loss.sum() / mask.sum()
+            elif reduction == "sum":
+                z_loss = z_loss.sum()
+            else:
+                z_loss = z_loss
+
+            return loss, z_loss
         else:
-            loss = loss
 
-        if not compute_z_loss:
-            return loss, None
+            if reduction == "mean":
+                loss = loss.sum() / mask.sum()
+            elif reduction == "sum":
+                loss = loss.sum()
+            else:
+                loss = loss
 
-        if reduction == "mean": # i will ignore z loss for now. 
-            z_loss = z_loss.sum() / mask.sum()
-        elif reduction == "sum":
-            z_loss = z_loss.sum()
-        else:
-            z_loss = z_loss
+            if not compute_z_loss:
+                return loss, None
 
-        return loss, z_loss
+            if reduction == "mean":
+                z_loss = z_loss.sum() / mask.sum()
+            elif reduction == "sum":
+                z_loss = z_loss.sum()
+            else:
+                z_loss = z_loss
+
+            return loss, z_loss
+
 
 except ImportError:
     fused_loss_fn = None
