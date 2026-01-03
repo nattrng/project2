@@ -170,7 +170,7 @@ try:
             k = (perp_indices.shape)[-1] #grabs last dim which is k.
             gathered_logits = torch.gather(logits, dim=2, index=perp_indices)
             gathered_logits_probs = F.softmax(gathered_logits, dim=-1)
-            gathered_nll = -torch.log(gathered_logits_probs) # (batch_len, seq_len, k)
+            gathered_nll = -torch.log(gathered_logits_probs + 1e-10) # (batch_len, seq_len, k)
             weighted_loss_tensor = gathered_nll * F.softmax(-perp_values, dim=-1) 
             surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) #(batch_len, seq_len) keepdim should be false automatically.
             
@@ -178,7 +178,7 @@ try:
             if reduction == "mean":
                 loss = (loss.sum() + surr_loss_term.sum()) / (mask.sum()+ (batch_size*seq_len*k))
             elif reduction == "sum":
-                loss = loss.sum() + surr_loss_term
+                loss = loss.sum() + surr_loss_term.sum()
             else:
                 loss = loss
 
