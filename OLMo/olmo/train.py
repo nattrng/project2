@@ -814,9 +814,8 @@ class Trainer:
                 surrogate_perp = torch.reciprocal(F.softmax(surrogate_logits, dim=-1) + 1e-8) # now rank using torch.topk or python sorted func. this is numerically the same. calcs per-token perplexity, not sequence.
                 labels = self.get_labels(batch) # (batch_size, seq_len -1) or (batch_size, seq_len), we will use them as indices to translate.
 
-                stacked_translation_tensor = self.lookup_self_to_surrogate_tokens.repeat((surr_batch_size, len(self.lookup_self_to_surrogate_tokens)))
+                stacked_translation_tensor = lookup_surrogate_to_self_tokens.unsqueeze(0).repeat(batch_size, 1)
                 translated_labels = torch.gather(input=stacked_translation_tensor, dim=1, index=labels)
-                
 
                 surrogate_perp.scatter_(dim=2, index=translated_labels.unsqueeze(-1), value=float('inf'))
             
