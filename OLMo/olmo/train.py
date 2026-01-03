@@ -139,6 +139,7 @@ try:
         labels,
         perp_values: torch.Tensor = None,
         perp_indices: torch.Tensor = None,
+        lookup_surrogate_to_self_tokens: torch.Tensor = None,
         ignore_index: int = -100,
         reduction: str = "mean",
         compute_z_loss: bool = False,
@@ -152,9 +153,14 @@ try:
         else:
             ignore_index_kwarg = {"ignored_index": ignore_index}
 
+        batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
+
+        stacked_translation_tensor = lookup_surrogate_to_self_tokens.repeat((batch_size, len(lookup_surrogate_to_self_tokens)))
+        translated_labels = torch.gather(input=stacked_translation_tensor, dim=1, index=labels)
+
         loss, z_loss = flash_cross_entropy_loss(
             logits,
-            labels,
+            translated_labels,
             label_smoothing=0.0,
             logit_scale=1.0,
             lse_square_scale=z_loss_multiplier,
@@ -163,18 +169,17 @@ try:
             **ignore_index_kwarg,
         )
 
-        mask = labels != ignore_index
+        mask = translated_labels != ignore_index
 
         if perp_indices is not None:
-            batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
             k = (perp_indices.shape)[-1] #grabs last dim which is k.
             gathered_logits = torch.gather(logits, dim=2, index=perp_indices)
             gathered_logits_probs = F.softmax(gathered_logits, dim=-1)
             gathered_nll = -torch.log(gathered_logits_probs + 1e-10) # (batch_len, seq_len, k)
             weighted_loss_tensor = gathered_nll * F.softmax(-perp_values, dim=-1) 
             surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) #(batch_len, seq_len) keepdim should be false automatically.
+        
             
-
             if reduction == "mean":
                 loss = (loss.sum() + surr_loss_term.sum()) / (mask.sum()+ (batch_size*seq_len*k))
             elif reduction == "sum":
@@ -265,6 +270,7 @@ class Trainer:
             self.surrogate_model.config.pad_token_id = self.surrogate_tokenizer.eos_token_id
 
         self.tokenizer = Tokenizer.from_train_config(config=self.cfg)
+        self.k = self.cfg.k
 
         # can be done either way, self tokenizer to surrogate or surrogate to self
         tokenizer_token_set = set(self.tokenizer.base_tokenizer.get_vocab().keys())
@@ -813,7 +819,7 @@ class Trainer:
                 
 
                 surrogate_perp.scatter_(dim=2, index=translated_labels.unsqueeze(-1), value=float('inf'))
-               
+            
                 vocab_idx = torch.arange(start=0, end=surr_vocab_size, device=self.device)
                 mask = ~torch.isin(vocab_idx, self.own_permitted_tokens) # true = not in. 
                 surrogate_perp.masked_fill_(mask, float('inf'))
@@ -823,7 +829,7 @@ class Trainer:
             # perp_values = topk.values  #(batch, seq_len, |vocab|) | dont need i think, we only need indices. could be useful for vis or analysis.
  
             perp_values, perp_indices = topk #(batch, seq_len, k (4 in this initial scenario))
-            
+
         else:
             perp_indices = None
             perp_values = None
@@ -836,7 +842,7 @@ class Trainer:
         # shape: (batch_size * seq_len,)
         labels = labels.view(-1)
         ce_loss, z_loss = self.loss_fn(
-            logits=logits_for_loss, labels=labels, perp_values=perp_values, perp_indices=perp_indices, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
+            logits=logits_for_loss, labels=labels, lookup_surrogate_to_self_tokens=self.lookup_surrogate_to_self_tokens, perp_values=perp_values, perp_indices=perp_indices, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
         )
         if loss_reduction == "none":
             # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
@@ -849,7 +855,7 @@ class Trainer:
         self, micro_batch: Dict[str, Any], batch_size_in_tokens: int
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         ce_loss, z_loss, logits = self.model_forward(
-            k=4, batch=micro_batch, compute_z_loss=self.cfg.softmax_auxiliary_loss, loss_reduction="sum"
+            k=self.k, batch=micro_batch, compute_z_loss=self.cfg.softmax_auxiliary_loss, loss_reduction="sum"
         )
         ce_loss = ce_loss / batch_size_in_tokens
 
