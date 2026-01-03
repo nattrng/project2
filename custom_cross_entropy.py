@@ -5,6 +5,7 @@ import torch.nn.functional as F
 def cross_entropy_loss(
     logits,
     labels,
+    perp_values: torch.Tensor = None,
     perp_indices: torch.Tensor = None, #should be rank 1 tensor
     ignore_index: int = -100,
     reduction: str = "mean",
@@ -15,12 +16,15 @@ def cross_entropy_loss(
         #we use torch.gather with the perp_indices as indices (batch_size, seq_len - 1, k). We use the output logits of shape (batch_size, seq_len - 1, vocab) 
         batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
         k = (perp_indices.shape)[-1] #grabs last dim which is k.
-        gathered_logit_probs = torch.gather(logits, dim=2, index=perp_indices)
+        gathered_logits = torch.gather(logits, dim=2, index=perp_indices)
+        gathered_logit_probs = F.softmax(gathered_logits, dim=-1)
         gathered_nll = -torch.log(gathered_logit_probs) # (batch_len, seq_len, k)
-        surr_loss_term = torch.sum(gathered_nll, dim=-1) #(batch_len, seq_len) keepdim should be false automatically.
+        weighted_loss_tensor = gathered_nll * F.softmax(-perp_values, dim=-1) 
+        surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) #(batch_len, seq_len) keepdim should be false automatically.
+
         
         
-        loss = surr_loss_term + F.cross_entropy(logits=logits, labels=labels, ignore_index=ignore_index, reduction='none') #reduction='none' returns tensor with losses. shoudl be in same shape as (batch_size, seq)
+        loss = surr_loss_term.sum() + F.cross_entropy(logits=logits, labels=labels, ignore_index=ignore_index, reduction='sum') #reduction='none' returns tensor with losses. shoudl be in same shape as (batch_size, seq)
         if reduction == "mean":
             loss /= ((labels != ignore_index).sum().item() + (batch_size * seq_len * k))
             
