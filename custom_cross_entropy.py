@@ -12,9 +12,16 @@ def cross_entropy_loss(
     z_loss_multiplier: float = 1e-4,
 ):
     if perp_indices is not None:        
-        #we use torch.gather with the perp_indices as indices (batch_size, seq_len - 1, 4). We use the output logits of shape (batch_size, seq_len - 1, vocab) 
-        gathered_auxiliary_loss_terms = torch.gather(logits, dim=2, index=perp_indices)
-        loss = torch.sum(weighted_perp_loss_tensor) + F.cross_entropy(logits=logits, labels=labels, ignore_index=ignore_index, reduction='none') #reduction='none' returns tensor with losses. shoudl be in same shape as (batch_size, seq)
+        #we use torch.gather with the perp_indices as indices (batch_size, seq_len - 1, k). We use the output logits of shape (batch_size, seq_len - 1, vocab) 
+        gathered_logit_probs = torch.gather(logits, dim=2, index=perp_indices)
+        gathered_nll = -torch.log(gathered_logit_probs) # (batch_len, seq_len, k)
+        surr_loss_term = torch.sum(gathered_nll, dim=-1) (batch_len, seq_len) keepdim should be false automatically.
+        
+        
+        
+        
+        
+        loss = surr_loss_term + F.cross_entropy(logits=logits, labels=labels, ignore_index=ignore_index, reduction='none') #reduction='none' returns tensor with losses. shoudl be in same shape as (batch_size, seq)
         if reduction == "mean":
             loss /= ((labels != ignore_index).sum().item() + len(weighted_perp_loss_tensor))
 
