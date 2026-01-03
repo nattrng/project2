@@ -271,9 +271,23 @@ class Trainer:
         surrogate_tokenizer_token_set = set(self.surrogate_tokenizer.get_vocab().keys())
         intersection = tokenizer_token_set.intersection(surrogate_tokenizer_token_set) 
         encoded_intersection = self.tokenizer.base_tokenizer.convert_tokens_to_ids(list(intersection)) #turns intersection set of strs to list of strs
-        self.permitted_tokens = torch.tensor(encoded_intersection)
+
+        self.own_permitted_tokens = torch.tensor(encoded_intersection)
+        self.surr_permitted_tokens = torch.tensor(self.surrogate_tokenizer.convert_tokens_to_ids(list(intersection))) # i think their strings line up, if decoded.
+
+        assert len(tokenizer_token_set) == self.tokenizer.base_tokenizer.vocab_size, "tokenizer_token_set size is unequal to vocab_size. this should not occur."
+
+        self.lookup_self_to_surrogate_tokens = torch.full(size=len(tokenizer_token_set), fill_value=-100, dtype=torch.long)
+        self.lookup_self_to_surrogate_tokens[self.own_permitted_tokens] = self.surr_permitted_tokens
+        self.lookup_self_to_surrogate_tokens.to(self.device)
+
+        self.lookup_surrogate_to_self_tokens = torch.full(size=len(surrogate_tokenizer_token_set), fill_value=-100, dtype=torch.long)
+        self.lookup_surrogate_to_self_tokens[self.surr_permitted_tokens] = self.own_permitted_tokens
+        self.lookup_surrogate_to_self_tokens.to(self.device)
 
 
+
+        
 
     @property
     def dataset(self) -> IterableDataset:
@@ -785,37 +799,34 @@ class Trainer:
                 surrogate_batch_encodings = (self.surrogate_tokenizer(batch_strings, padding=True, return_tensors='pt')).to(self.device) #pad to ensure seq_len remains the same.
 
                 outputs = self.surrogate_model(**surrogate_batch_encodings)
-                surrogate_logits = (outputs.logits)[..., :-1, :].contiguous() # should be (batch, seq_len-1, |vocab|) due to olmo's shift. their seq_len is diff though bc of different tokenizer. had to 
+                surrogate_logits = (outputs.logits)[..., :-1, :].contiguous() # should be (batch, seq_len-1, |surr_vocab|) due to olmo's shift. their seq_len is diff though bc of different tokenizer. had to 
                 surr_batch_size, surr_seq_len, surr_vocab_size = surrogate_logits.shape #seq_len should be originnal seq_len - 1 due to shift.
 
 
 
                 #we want to calculate hte perplexities across rows.  
                 surrogate_perp = torch.reciprocal(F.softmax(surrogate_logits, dim=-1) + 1e-8) # now rank using torch.topk or python sorted func. this is numerically the same. calcs per-token perplexity, not sequence.
-                labels = self.get_labels(batch)
-                surrogate_perp.scatter_(dim=2, index=labels.unsqueeze(-1), value=float('inf'))
-                # for b in range(surr_batch_size):
-                #     for s in range(surr_seq_len):
-                #         surrogate_perp[b, s, labels[b, s]] = float('inf')
-                #surrogate_perp should be (batch_size, seq_len, vocab). should do masking here. alright. for those not in set, set to float('inf') I GOT IT
+                labels = self.get_labels(batch) # (batch_size, seq_len -1) or (batch_size, seq_len), we will use them as indices to translate.
+
+                stacked_translation_tensor = self.lookup_self_to_surrogate_tokens.repeat((surr_batch_size, len(self.lookup_self_to_surrogate_tokens)))
+                translated_labels = torch.gather(input=stacked_translation_tensor, dim=1, index=labels)
+                
+
+                surrogate_perp.scatter_(dim=2, index=translated_labels.unsqueeze(-1), value=float('inf'))
+               
                 vocab_idx = torch.arange(start=0, end=surr_vocab_size, device=self.device)
-                mask = ~torch.isin(vocab_idx, self.permitted_tokens) # true = not in. 
+                mask = ~torch.isin(vocab_idx, self.own_permitted_tokens) # true = not in. 
                 surrogate_perp.masked_fill_(mask, float('inf'))
 
 
             topk = torch.topk(surrogate_perp, k=k, largest=False, sorted=True, dim=-1) # k is relative per row. might have to perform masking then topk | for now, we can just set k = to some arbitrary value.
             # perp_values = topk.values  #(batch, seq_len, |vocab|) | dont need i think, we only need indices. could be useful for vis or analysis.
  
-            perp_indices = topk.indices #(batch, seq_len, k (4 in this initial scenario))
+            perp_values, perp_indices = topk #(batch, seq_len, k (4 in this initial scenario))
             
-            # # we want surrogate_ce_tensor to be (batch_size, , 1). where the 1 value is the aggregated perplexities for that seq. 
-
-            # surrogate_ce_tensor = torch.cat([-torch.log(F.softmax(logits[b, s, [s, filtered_perp_indices[b, s]]], dim=-1)) * F.softmax(-torch.log(F.softmax(-(logits[b, s, [s, filtered_perp_indices[b, s]]]), dim=-1)), dim=-1) for s in range(surr_seq_len) for b in range(surr_batch_size)]) # calc perplexity via exp(-log(probs)) | issue: they are alld isconnected. they have to be added elementwise.
-            # for b in range(btc):
-            #     for s in range(seq):
-            #         logits[b, s, [s, perp_indices[b, s]]]#gets a row of 4 indices
         else:
             perp_indices = None
+            perp_values = None
         
         logits_for_loss = logits[..., :-1, :].contiguous()
         # shape: (batch_size * seq_len, vocab_size)
@@ -825,7 +836,7 @@ class Trainer:
         # shape: (batch_size * seq_len,)
         labels = labels.view(-1)
         ce_loss, z_loss = self.loss_fn(
-            logits=logits_for_loss, labels=labels, perp_indices=perp_indices, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
+            logits=logits_for_loss, labels=labels, perp_values=perp_values, perp_indices=perp_indices, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
         )
         if loss_reduction == "none":
             # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
