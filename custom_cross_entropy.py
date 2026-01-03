@@ -13,17 +13,17 @@ def cross_entropy_loss(
 ):
     if perp_indices is not None:        
         #we use torch.gather with the perp_indices as indices (batch_size, seq_len - 1, k). We use the output logits of shape (batch_size, seq_len - 1, vocab) 
+        batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
+        k = (perp_indices.shape)[-1] #grabs last dim which is k.
         gathered_logit_probs = torch.gather(logits, dim=2, index=perp_indices)
         gathered_nll = -torch.log(gathered_logit_probs) # (batch_len, seq_len, k)
-        surr_loss_term = torch.sum(gathered_nll, dim=-1) (batch_len, seq_len) keepdim should be false automatically.
-        
-        
-        
+        surr_loss_term = torch.sum(gathered_nll, dim=-1) #(batch_len, seq_len) keepdim should be false automatically.
         
         
         loss = surr_loss_term + F.cross_entropy(logits=logits, labels=labels, ignore_index=ignore_index, reduction='none') #reduction='none' returns tensor with losses. shoudl be in same shape as (batch_size, seq)
         if reduction == "mean":
-            loss /= ((labels != ignore_index).sum().item() + len(weighted_perp_loss_tensor))
+            loss /= ((labels != ignore_index).sum().item() + (batch_size * seq_len * k))
+            
 
         if not compute_z_loss:
             return loss, None
@@ -52,3 +52,5 @@ def cross_entropy_loss(
             z_squared = (z_squared * (labels != ignore_index)).sum()
 
         z_loss = z_loss_multiplier * z_squared
+
+        return loss, z_loss
