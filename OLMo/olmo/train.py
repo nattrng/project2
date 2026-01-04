@@ -30,7 +30,7 @@ from packaging import version
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from custom_cross_entropy import cross_entropy_loss
+from olmo.custom_cross_entropy import cross_entropy_loss
 
 from .aliases import PathOrStr
 from .checkpoint import Checkpointer, FullCheckpointer, build_sharded_checkpointer
@@ -227,7 +227,6 @@ class Trainer:
     cfg: TrainConfig
     model: OLMo
     dist_model: Union[DDP, FSDP, SingleAccelerator]
-    surrogate_model_name: str
     optim: Optimizer
     scheduler: Scheduler
     train_loader: DataLoader
@@ -269,6 +268,7 @@ class Trainer:
 
         self.tokenizer = Tokenizer.from_train_config(config=self.cfg)
         self.k = self.cfg.k
+        self.surrogate_model_name = self.cfg.surrogate_model_name
 
         # can be done either way, self tokenizer to surrogate or surrogate to self
         tokenizer_token_set = set(self.tokenizer.base_tokenizer.get_vocab().keys())
