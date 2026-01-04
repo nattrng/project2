@@ -827,7 +827,6 @@ class Trainer:
 
                 #surr_perp is of size (batch, seq_ vocab). 
 
-
                 #we want to calculate hte perplexities across rows.  
                 surrogate_perp = torch.reciprocal(F.softmax(surrogate_logits, dim=-1) + 1e-8) # now rank using torch.topk or python sorted func. this is numerically the same. calcs per-token perplexity, not sequence.
                 labels = self.get_labels(batch) # (batch_size, seq_len -1) or (batch_size, seq_len), we will use them as indices to translate.
@@ -836,17 +835,21 @@ class Trainer:
                 translated_labels = torch.gather(input=stacked_translation_tensor, dim=1, index=labels)
                 
                 # i'm pretty sure trasnlated_labels already has -100 for invalid ones. 
+
+                invalid_row_mask = (translated_labels == -100).unsqueeze(-1)
+                surrogate_perp.masked_fill_(invalid_row_mask, float('inf')) #fills row iwith inf so that it conforms to ce implementation
+
+                valid_mask = translated_labels != -100
+                valid_indices = translated_labels[valid_mask].unsqueeze(-1)
                 
-                surrogate_perp.scatter_(dim=2, index=translated_labels.unsqueeze(-1), value=float('inf'))
+                surrogate_perp[valid_mask].scatter_(dim=-1, index=valid_indices, value=float('inf'))
                 
                 vocab_idx = torch.arange(start=0, end=surr_vocab_size, device=self.device)
                 mask = ~torch.isin(vocab_idx, self.own_permitted_tokens) # true = not in. 
                 surrogate_perp.masked_fill_(mask, float('inf'))
 
 
-            topk = torch.topk(surrogate_perp, k=k, largest=False, sorted=True, dim=-1) # k is relative per row. might have to perform masking then topk | for now, we can just set k = to some arbitrary value.
-            # perp_values = topk.values  #(batch, seq_len, |vocab|) | dont need i think, we only need indices. could be use)l for vis or analysis.
- 
+            topk = torch.topk(surrogate_perp, k=k, largest=False, sorted=True, dim=-1) # k is relative per row. might have to perform masking then topk | for now, we can just set k = to some arbitrary value. 
             perp_values, perp_indices = topk #(batch, seq_len, k (4 in this initial scenario))
             
         else:
