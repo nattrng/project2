@@ -177,7 +177,7 @@ try:
             surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) 
             
             if reduction == "mean":
-                loss = (loss.sum() + surr_loss_term.sum()) / (mask.sum()+ (batch_size*seq_len*self.k))
+                loss = (loss.sum() + surr_loss_term.sum()) / (mask.sum()+ (batch_size*seq_len*self.k - non_included))
             elif reduction == "sum":
                 loss = loss.sum() + surr_loss_term.sum()
             else:
