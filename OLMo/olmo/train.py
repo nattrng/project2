@@ -160,9 +160,7 @@ try:
 
         if perp_indices is not None:        
         #we use torch.gather with the perp_indices as indices (batch_size, seq_len - 1, k). We use the output logits of shape (batch_size, seq_len - 1, vocab) 
-            batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
-            k = (perp_indices.shape)[-1] #grabs last dim which is k.
-            
+            batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]            
             translated_perp_indices = lookup_surrogate_to_self_tokens[perp_indices]                                                                
             gathered_logits = torch.gather(logits, dim=2, index=translated_perp_indicies)
             gathered_logit_probs = F.softmax(gathered_logits, dim=-1)
