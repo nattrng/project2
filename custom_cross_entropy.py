@@ -24,7 +24,7 @@ def cross_entropy_loss(
         gathered_nll = -torch.log(gathered_logit_probs + 1e-10) # (batch_len, seq_len, k)
 
         isinf_bool = torch.isinf(perp_values).all(dim=-1)
-        mask = (~is_row_all_inf).unsqueeze(-1)
+        mask = (~isinf_bool).unsqueeze(-1)
 
         masked_softmax_weight = F.softmax(-perp_values, dim=-1) * mask
         
