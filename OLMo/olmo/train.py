@@ -280,7 +280,7 @@ class Trainer:
         self.surr_permitted_tokens = torch.tensor(self.surrogate_tokenizer.convert_tokens_to_ids(list(intersection))) # i think their strings line up, if decoded.
 
         self.own_permitted_tokens = self.own_permitted_tokens.to(self.device)
-        self.surr_permitted_tokens = self.own_permitted_tokens.to(self.device)
+        self.surr_permitted_tokens = self.surr_permitted_tokens.to(self.device)
 
         assert len(tokenizer_token_set) == self.tokenizer.base_tokenizer.vocab_size, "tokenizer_token_set size is unequal to vocab_size. this should not occur."
 
