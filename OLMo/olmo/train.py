@@ -156,47 +156,30 @@ try:
         batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
 
 
-        try:
-            loss, z_loss = flash_cross_entropy_loss(
-                logits,
-                labels,
-                label_smoothing=0.0,
-                logit_scale=1.0,
-                lse_square_scale=z_loss_multiplier,
-                inplace_backward=False,
-                process_group=None,
-                **ignore_index_kwarg,
-            )
-        except Exception:
-            log.warning(
-                "flash_attn fused loss failed; falling back to unfused cross-entropy.",
-                exc_info=True,
-            )
-            return cross_entropy_loss(
-                logits=logits,
-                labels=labels,
-                perp_values=perp_values,
-                perp_indices=perp_indices,
-                lookup_surrogate_to_self_tokens=lookup_surrogate_to_self_tokens,
-                ignore_index=ignore_index,
-                reduction=reduction,
-                compute_z_loss=compute_z_loss,
-                z_loss_multiplier=z_loss_multiplier,
-            )
-
         mask = labels != ignore_index
 
-        if perp_indices is not None:
+        if perp_indices is not None:        
+        #we use torch.gather with the perp_indices as indices (batch_size, seq_len - 1, k). We use the output logits of shape (batch_size, seq_len - 1, vocab) 
+            batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
             k = (perp_indices.shape)[-1] #grabs last dim which is k.
-            gathered_logits = torch.gather(logits, dim=2, index=perp_indices)
-            gathered_logits_probs = F.softmax(gathered_logits, dim=-1)
-            gathered_nll = -torch.log(gathered_logits_probs + 1e-10) # (batch_len, seq_len, k)
-            weighted_loss_tensor = gathered_nll * F.softmax(-perp_values, dim=-1) 
-            surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) #(batch_len, seq_len) keepdim should be false automatically.
-        
+            
+            translated_perp_indices = lookup_surrogate_to_self_tokens[perp_indices]                                                                
+            gathered_logits = torch.gather(logits, dim=2, index=translated_perp_indicies)
+            gathered_logit_probs = F.softmax(gathered_logits, dim=-1)
+            gathered_nll = -torch.log(gathered_logit_probs + 1e-10) # (batch_len, seq_len, k)
+    
+            isinf_bool = torch.isinf(perp_values).all(dim=-1)
+            non_included = torch.count_zeros(isinf_bool).item() * self.k
+            other_mask = (~isinf_bool).unsqueeze(-1)
+            
+    
+            masked_softmax_weight = F.softmax(-perp_values, dim=-1) * other_mask
+            
+            weighted_loss_tensor = gathered_nll * masked_softmax_weight
+            surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) 
             
             if reduction == "mean":
-                loss = (loss.sum() + surr_loss_term.sum()) / (mask.sum()+ (batch_size*seq_len*k))
+                loss = (loss.sum() + surr_loss_term.sum()) / (mask.sum()+ (batch_size*seq_len*self.k))
             elif reduction == "sum":
                 loss = loss.sum() + surr_loss_term.sum()
             else:
