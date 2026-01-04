@@ -257,19 +257,25 @@ class Trainer:
                 self.loss_fn = fused_loss_fn
             else:
                 raise NameError("`fused_loss_fn` is not defined. Please ensure that `flash_attn` is installed.")
-        
+
+        self.k = self.cfg.k
         self.surrogate_model_name = self.cfg.surrogate_model_name
             
         self.surrogate_model = AutoModelForCausalLM.from_pretrained(self.surrogate_model_name, torch_dtype=torch.float16)
         self.surrogate_model.to(self.device).eval()
-        
+
+        self.tokenizer = Tokenizer.from_train_config(config=self.cfg)
         self.surrogate_tokenizer = AutoTokenizer.from_pretrained(self.surrogate_model_name, padding_side='left') #left bc we are performing "inference". we do not wish for the last token seen to be padding. push it to the rgiht
+       
+        surr_eos_token_id = self.surrogate_tokenizer.eos_token_id
+        surr_pad_token_id = self.surrogate_tokenizer.pad_token_id
+
+        self.surrogate_tokenizer.eos_token = own_eos_token_str
+         
         if self.surrogate_tokenizer.pad_token is None:
             self.surrogate_tokenizer.pad_token = self.surrogate_tokenizer.eos_token
             self.surrogate_model.config.pad_token_id = self.surrogate_tokenizer.eos_token_id
 
-        self.tokenizer = Tokenizer.from_train_config(config=self.cfg)
-        self.k = self.cfg.k
 
         # can be done either way, self tokenizer to surrogate or surrogate to self
         tokenizer_token_set = set(self.tokenizer.base_tokenizer.get_vocab().keys())
@@ -293,6 +299,14 @@ class Trainer:
         self.lookup_surrogate_to_self_tokens[self.surr_permitted_tokens] = self.own_permitted_tokens
         self.lookup_surrogate_to_self_tokens = self.lookup_surrogate_to_self_tokens.to(self.device)
 
+        # encoded_str_lens = [len(self.surrogate_tokenizer.encode(str).tokens) for str in self.tokenizer.get_vocab().keys()] 
+        # max_len = max(encoded_str_lens)
+        # print(max_len)
+
+        # empty_dict = {}
+        # for token_id in self.own_permitted_tokens.base_tokenizer.get_vocab().values():
+        #     empty_dict[token_id] = self.
+            
 
 
         
@@ -811,6 +825,7 @@ class Trainer:
                 surrogate_logits = (outputs.logits)[..., :-1, :].contiguous() # should be (batch, seq_len-1, |surr_vocab|) due to olmo's shift. their seq_len is diff though bc of different tokenizer. had to 
                 surr_batch_size, surr_seq_len, surr_vocab_size = surrogate_logits.shape #seq_len should be originnal seq_len - 1 due to shift.
 
+                #surr_perp is of size (batch, seq_ vocab). 
 
 
                 #we want to calculate hte perplexities across rows.  
@@ -820,7 +835,8 @@ class Trainer:
                 stacked_translation_tensor = self.lookup_self_to_surrogate_tokens.repeat((surr_batch_size, len(self.lookup_self_to_surrogate_tokens)))
                 translated_labels = torch.gather(input=stacked_translation_tensor, dim=1, index=labels)
                 
-
+                # i'm pretty sure trasnlated_labels already has -100 for invalid ones. 
+                
                 surrogate_perp.scatter_(dim=2, index=translated_labels.unsqueeze(-1), value=float('inf'))
                 
                 vocab_idx = torch.arange(start=0, end=surr_vocab_size, device=self.device)
