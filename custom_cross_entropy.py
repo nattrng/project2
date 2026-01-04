@@ -22,7 +22,13 @@ def cross_entropy_loss(
         gathered_logits = torch.gather(logits, dim=2, index=translated_perp_indicies)
         gathered_logit_probs = F.softmax(gathered_logits, dim=-1)
         gathered_nll = -torch.log(gathered_logit_probs + 1e-10) # (batch_len, seq_len, k)
-        weighted_loss_tensor = gathered_nll * F.softmax(-perp_values, dim=-1) 
+
+        isinf_bool = torch.isinf(perp_values).all(dim=-1)
+        mask = (~is_row_all_inf).unsqueeze(-1)
+
+        masked_softmax_weight = F.softmax(-perp_values, dim=-1) * mask
+        
+        weighted_loss_tensor = gathered_nll * masked_softmax_weight
         surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) #(batch_len, seq_len) keepdim should be false automatically.
         
         
