@@ -1314,6 +1314,11 @@ class TrainConfig(BaseConfig):
     can be compared using `scripts/compare_module_outputs.py`.
     """
 
+    surrogate_model_name: str = 'Qwen/Qwen3-0.6B'
+    k: int = 6
+
+
+
     @property
     def autocast_precision(self) -> torch.dtype:
         if self.precision == "amp_bf16":
