@@ -257,6 +257,8 @@ class Trainer:
                 self.loss_fn = fused_loss_fn
             else:
                 raise NameError("`fused_loss_fn` is not defined. Please ensure that `flash_attn` is installed.")
+        
+        self.surrogate_model_name = self.cfg.surrogate_model_name
             
         self.surrogate_model = AutoModelForCausalLM.from_pretrained(self.surrogate_model_name, torch_dtype=torch.float16)
         self.surrogate_model.to(self.device).eval()
@@ -268,13 +270,12 @@ class Trainer:
 
         self.tokenizer = Tokenizer.from_train_config(config=self.cfg)
         self.k = self.cfg.k
-        self.surrogate_model_name = self.cfg.surrogate_model_name
 
         # can be done either way, self tokenizer to surrogate or surrogate to self
         tokenizer_token_set = set(self.tokenizer.base_tokenizer.get_vocab().keys())
         surrogate_tokenizer_token_set = set(self.surrogate_tokenizer.get_vocab().keys())
         intersection = tokenizer_token_set.intersection(surrogate_tokenizer_token_set) 
-        encoded_intersection = self.tokenizer.base_tokenizer.convert_tokens_to_ids(list(intersection)) #turns intersection set of strs to list of strs
+        encoded_intersection = [self.tokenizer.base_tokenizer.token_to_id(token) for token in intersection]  #turns intersection set of strs to list of strs
 
         self.own_permitted_tokens = torch.tensor(encoded_intersection)
         self.surr_permitted_tokens = torch.tensor(self.surrogate_tokenizer.convert_tokens_to_ids(list(intersection))) # i think their strings line up, if decoded.
@@ -282,13 +283,13 @@ class Trainer:
         self.own_permitted_tokens = self.own_permitted_tokens.to(self.device)
         self.surr_permitted_tokens = self.surr_permitted_tokens.to(self.device)
 
-        assert len(tokenizer_token_set) == self.tokenizer.base_tokenizer.vocab_size, "tokenizer_token_set size is unequal to vocab_size. this should not occur."
+        assert len(tokenizer_token_set) == self.tokenizer.base_tokenizer.get_vocab_size(), "tokenizer_token_set size is unequal to vocab_size. this should not occur."
 
-        self.lookup_self_to_surrogate_tokens = torch.full(size=(len(tokenizer_token_set),), fill_value=-100, dtype=torch.long)
+        self.lookup_self_to_surrogate_tokens = torch.full(size=(len(tokenizer_token_set),), fill_value=-100, dtype=torch.long).to(self.device)
         self.lookup_self_to_surrogate_tokens[self.own_permitted_tokens] = self.surr_permitted_tokens
         self.lookup_self_to_surrogate_tokens = self.lookup_self_to_surrogate_tokens.to(self.device)
 
-        self.lookup_surrogate_to_self_tokens = torch.full(size=(len(surrogate_tokenizer_token_set),), fill_value=-100, dtype=torch.long)
+        self.lookup_surrogate_to_self_tokens = torch.full(size=(len(surrogate_tokenizer_token_set),), fill_value=-100, dtype=torch.long).to(self.device)
         self.lookup_surrogate_to_self_tokens[self.surr_permitted_tokens] = self.own_permitted_tokens
         self.lookup_surrogate_to_self_tokens = self.lookup_surrogate_to_self_tokens.to(self.device)
 
@@ -802,7 +803,8 @@ class Trainer:
         if k != 0:
             with torch.no_grad():
                 input_ids = batch["input_ids"]
-                batch_strings = self.tokenizer.base_tokenizer.decode_batch(input_ids, skip_special_tokens=True) #skip. im sure they already have special tokens in the vocab.
+                input_ids_list = input_ids.tolist()
+                batch_strings = self.tokenizer.base_tokenizer.decode_batch(input_ids_list, skip_special_tokens=True) #skip. im sure they already have special tokens in the vocab.
                 surrogate_batch_encodings = (self.surrogate_tokenizer(batch_strings, padding=True, return_tensors='pt')).to(self.device) #padding alleviates the issue with disparate tokenization.
 
                 outputs = self.surrogate_model(**surrogate_batch_encodings)
