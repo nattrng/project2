@@ -24,6 +24,7 @@ def cross_entropy_loss(
         gathered_nll = -torch.log(gathered_logit_probs + 1e-10) # (batch_len, seq_len, k)
 
         isinf_bool = torch.isinf(perp_values).all(dim=-1)
+        non_included = torch.count_zeros(isinf_bool).item() * self.k
         mask = (~isinf_bool).unsqueeze(-1)
 
         masked_softmax_weight = F.softmax(-perp_values, dim=-1) * mask
@@ -34,7 +35,7 @@ def cross_entropy_loss(
         
         loss = surr_loss_term.sum() + F.cross_entropy(logits=logits, labels=labels, ignore_index=ignore_index, reduction='sum') #reduction='none' returns tensor with losses. shoudl be in same shape as (batch_size, seq)
         if reduction == "mean":
-            loss /= ((labels != ignore_index).sum().item() + (batch_size * seq_len * k))
+            loss /= ((labels != ignore_index).sum().item() + (batch_size * seq_len * k - non_included))
             
 
         if not compute_z_loss:
