@@ -270,7 +270,7 @@ class Trainer:
         surr_eos_token_id = self.surrogate_tokenizer.eos_token_id
         surr_pad_token_id = self.surrogate_tokenizer.pad_token_id
 
-        self.surrogate_tokenizer.eos_token = own_eos_token_str
+        # self.surrogate_tokenizer.eos_token = own_eos_token_str
          
         if self.surrogate_tokenizer.pad_token is None:
             self.surrogate_tokenizer.pad_token = self.surrogate_tokenizer.eos_token
