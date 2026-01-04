@@ -156,16 +156,33 @@ try:
         batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
 
 
-        loss, z_loss = flash_cross_entropy_loss(
-            logits,
-            labels,
-            label_smoothing=0.0,
-            logit_scale=1.0,
-            lse_square_scale=z_loss_multiplier,
-            inplace_backward=False,
-            process_group=None,
-            **ignore_index_kwarg,
-        )
+        try:
+            loss, z_loss = flash_cross_entropy_loss(
+                logits,
+                labels,
+                label_smoothing=0.0,
+                logit_scale=1.0,
+                lse_square_scale=z_loss_multiplier,
+                inplace_backward=False,
+                process_group=None,
+                **ignore_index_kwarg,
+            )
+        except Exception:
+            log.warning(
+                "flash_attn fused loss failed; falling back to unfused cross-entropy.",
+                exc_info=True,
+            )
+            return cross_entropy_loss(
+                logits=logits,
+                labels=labels,
+                perp_values=perp_values,
+                perp_indices=perp_indices,
+                lookup_surrogate_to_self_tokens=lookup_surrogate_to_self_tokens,
+                ignore_index=ignore_index,
+                reduction=reduction,
+                compute_z_loss=compute_z_loss,
+                z_loss_multiplier=z_loss_multiplier,
+            )
 
         mask = labels != ignore_index
 
@@ -831,8 +848,20 @@ class Trainer:
                 surrogate_perp = torch.reciprocal(F.softmax(surrogate_logits, dim=-1) + 1e-8) # now rank using torch.topk or python sorted func. this is numerically the same. calcs per-token perplexity, not sequence.
                 labels = self.get_labels(batch) # (batch_size, seq_len -1) or (batch_size, seq_len), we will use them as indices to translate.
 
-                stacked_translation_tensor = self.lookup_self_to_surrogate_tokens.repeat((surr_batch_size, len(self.lookup_self_to_surrogate_tokens)))
-                translated_labels = torch.gather(input=stacked_translation_tensor, dim=1, index=labels)
+                translated_labels = torch.full_like(labels, fill_value=-100)
+                valid_label_mask = labels != -100
+                translated_labels[valid_label_mask] = self.lookup_self_to_surrogate_tokens[labels[valid_label_mask]]
+
+                if labels.shape[1] != surrogate_perp.shape[1]:
+                    min_seq_len = min(labels.shape[1], surrogate_perp.shape[1])
+                    labels = labels[:, :min_seq_len]
+                    surrogate_perp = surrogate_perp[:, :min_seq_len, :]
+
+                lookup_self_to_surrogate_tokens = self.lookup_self_to_surrogate_tokens.to(self.device)
+                safe_labels = labels.clone()
+                safe_labels[safe_labels == -100] = 0
+                translated_labels = lookup_self_to_surrogate_tokens[safe_labels]
+                translated_labels = translated_labels.masked_fill(labels == -100, -100)
                 
                 # i'm pretty sure trasnlated_labels already has -100 for invalid ones. 
 
@@ -845,7 +874,7 @@ class Trainer:
                 surrogate_perp[valid_mask].scatter_(dim=-1, index=valid_indices, value=float('inf'))
                 
                 vocab_idx = torch.arange(start=0, end=surr_vocab_size, device=self.device)
-                mask = ~torch.isin(vocab_idx, self.own_permitted_tokens) # true = not in. 
+                mask = ~torch.isin(vocab_idx, self.surr_permitted_tokens) # true = not in. 
                 surrogate_perp.masked_fill_(mask, float('inf'))
 
 
