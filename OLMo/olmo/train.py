@@ -320,6 +320,10 @@ class Trainer:
         self.lookup_surrogate_to_self_tokens[self.surr_permitted_tokens] = self.own_permitted_tokens
         self.lookup_surrogate_to_self_tokens = self.lookup_surrogate_to_self_tokens.to(self.device)
 
+        surr_vocab_size = self.surrogate_model.config.vocab_size
+        self.surr_disallowed_mask = torch.ones(surr_vocab_size, dtype=torch.bool, device=self.device)
+        self.surr_disallowed_mask[self.surr_permitted_tokens] = False
+
         # encoded_str_lens = [len(self.surrogate_tokenizer.encode(str).tokens) for str in self.tokenizer.get_vocab().keys()] 
         # max_len = max(encoded_str_lens)
         # print(max_len)
@@ -839,7 +843,9 @@ class Trainer:
             with torch.no_grad():
                 input_ids = batch["input_ids"]
                 attention_mask = batch.get("attention_mask")
-                input_ids_list = input_ids.tolist()
+                input_ids_list = batch.get("input_ids_list")
+                if input_ids_list is None:
+                    input_ids_list = input_ids.tolist()
                 batch_strings = self.tokenizer.base_tokenizer.decode_batch(
                     input_ids_list, skip_special_tokens=True
                 )
@@ -874,59 +880,57 @@ class Trainer:
                     surr_attention_mask = torch.ones(offset_mapping.shape[:2], dtype=torch.long)
 
                 labels_len = labels.shape[1]
-                alignment_indices = [[-1] * labels_len for _ in range(len(batch_strings))]
-                surr_offsets_list = offset_mapping.tolist()
-                surr_attention_list = surr_attention_mask.tolist()
-                attn_mask_list = attention_mask.tolist() if attention_mask is not None else None
+                surr_offsets = offset_mapping.to(self.device)
+                surr_attention_mask = surr_attention_mask.to(self.device)
+                target_offsets = [
+                    torch.tensor(enc.offsets, device=self.device, dtype=torch.long)
+                    for enc in target_encodings
+                ]
+                alignment_indices = torch.full(
+                    (len(batch_strings), labels_len), -1, device=self.device, dtype=torch.long
+                )
+                eos_token_id = self.tokenizer.eos_token_id
+                pad_token_id = self.tokenizer.pad_token_id
 
                 for batch_idx in range(len(batch_strings)):
-                    target_offsets = target_encodings[batch_idx].offsets
-                    valid_surrogate = []
-                    for s_idx, (s_start, s_end) in enumerate(surr_offsets_list[batch_idx]):
-                        if surr_attention_list[batch_idx][s_idx] == 0:
-                            continue
-                        if s_start == s_end:
-                            continue
-                        valid_surrogate.append((s_idx, s_start, s_end))
+                    t_offsets = target_offsets[batch_idx]
+                    if t_offsets.numel() == 0:
+                        continue
+                    s_offsets = surr_offsets[batch_idx]
+                    s_mask = surr_attention_mask[batch_idx] != 0
 
-                    target_to_surr_idx = []
-                    for t_start, t_end in target_offsets:
-                        if t_start == t_end:
-                            target_to_surr_idx.append(-1)
-                            continue
-                        best_idx = -1
-                        best_overlap = 0
-                        for s_idx, s_start, s_end in valid_surrogate:
-                            overlap = min(t_end, s_end) - max(t_start, s_start)
-                            if overlap > best_overlap:
-                                best_overlap = overlap
-                                best_idx = s_idx
-                        target_to_surr_idx.append(best_idx if best_overlap > 0 else -1)
+                    t_start = t_offsets[:, 0].unsqueeze(1)
+                    t_end = t_offsets[:, 1].unsqueeze(1)
+                    s_start = s_offsets[:, 0].unsqueeze(0)
+                    s_end = s_offsets[:, 1].unsqueeze(0)
+                    overlap = torch.minimum(t_end, s_end) - torch.maximum(t_start, s_start)
+                    overlap = overlap.clamp(min=0)
+                    valid_s = s_mask & (s_offsets[:, 0] != s_offsets[:, 1])
+                    valid_t = t_offsets[:, 0] != t_offsets[:, 1]
+                    overlap = overlap * valid_s.unsqueeze(0).to(overlap.dtype)
+                    overlap = overlap * valid_t.unsqueeze(1).to(overlap.dtype)
+                    best_overlap, best_idx = overlap.max(dim=1)
+                    target_to_surr_idx = torch.where(
+                        best_overlap > 0, best_idx, torch.full_like(best_idx, -1)
+                    )
 
-                    encoding_ids = target_encodings[batch_idx].ids
-                    row_ids = input_ids_list[batch_idx]
-                    row_attn = attn_mask_list[batch_idx] if attn_mask_list is not None else None
-                    text_positions = []
-                    pos = 0
-                    for idx, token_id in enumerate(row_ids):
-                        if row_attn is not None and row_attn[idx] == 0:
-                            continue
-                        if pos < len(encoding_ids) and token_id == encoding_ids[pos]:
-                            text_positions.append(idx)
-                            pos += 1
-                            if pos == len(encoding_ids):
-                                break
-
-                    min_len = min(len(text_positions), len(target_to_surr_idx))
-                    for i in range(min_len):
-                        surr_idx = target_to_surr_idx[i]
-                        if surr_idx <= 0:
-                            continue
-                        label_pos = text_positions[i] - 1
-                        if 0 <= label_pos < labels_len:
-                            alignment_indices[batch_idx][label_pos] = surr_idx - 1
-
-                alignment_indices = torch.tensor(alignment_indices, device=self.device, dtype=torch.long)
+                    row_ids = input_ids[batch_idx]
+                    if attention_mask is not None:
+                        valid_input = attention_mask[batch_idx] != 0
+                    else:
+                        valid_input = torch.ones_like(row_ids, dtype=torch.bool)
+                    if eos_token_id is not None:
+                        valid_input = valid_input & (row_ids != eos_token_id)
+                    if pad_token_id is not None:
+                        valid_input = valid_input & (row_ids != pad_token_id)
+                    text_positions = valid_input.nonzero(as_tuple=False).squeeze(1)
+                    min_len = min(text_positions.numel(), target_to_surr_idx.numel())
+                    if min_len == 0:
+                        continue
+                    surr_idx = target_to_surr_idx[:min_len]
+                    label_pos = text_positions[:min_len] - 1
+                    valid = (surr_idx > 0) & (label_pos >= 0) & (label_pos < labels_len)
+                    alignment_indices[batch_idx, label_pos[valid]] = surr_idx[valid] - 1
                 clamped_indices = alignment_indices.clamp(min=0)
                 gathered_perp = surrogate_perp.gather(
                     dim=1,
@@ -953,9 +957,7 @@ class Trainer:
                 
                 surrogate_perp[valid_mask].scatter_(dim=-1, index=valid_indices, value=float('inf'))
                 
-                vocab_idx = torch.arange(start=0, end=surr_vocab_size, device=self.device)
-                mask = ~torch.isin(vocab_idx, self.surr_permitted_tokens) # true = not in. 
-                surrogate_perp.masked_fill_(mask, float('inf'))
+                surrogate_perp.masked_fill_(self.surr_disallowed_mask, float("inf"))
 
 
             topk = torch.topk(surrogate_perp, k=k, largest=False, sorted=True, dim=-1) # k is relative per row. might have to perform masking then topk | for now, we can just set k = to some arbitrary value. 
@@ -1094,6 +1096,10 @@ class Trainer:
         self.optim.zero_grad(set_to_none=True)
 
         # Move tensors to the right device.
+        if self.k != 0 and "input_ids_list" not in batch:
+            input_ids = batch.get("input_ids")
+            if isinstance(input_ids, torch.Tensor):
+                batch["input_ids_list"] = input_ids.tolist()
         batch = move_to_device(batch, self.device)
 
         # Run forward-backward pass.
