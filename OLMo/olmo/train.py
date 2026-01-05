@@ -815,30 +815,106 @@ class Trainer:
         if k != 0:
             with torch.no_grad():
                 input_ids = batch["input_ids"]
+                attention_mask = batch.get("attention_mask")
                 input_ids_list = input_ids.tolist()
-                batch_strings = self.tokenizer.base_tokenizer.decode_batch(input_ids_list, skip_special_tokens=True) #skip. im sure they already have special tokens in the vocab.
-                surrogate_batch_encodings = (self.surrogate_tokenizer(batch_strings, padding=True, return_tensors='pt')).to(self.device) #padding alleviates the issue with disparate tokenization.
+                batch_strings = self.tokenizer.base_tokenizer.decode_batch(
+                    input_ids_list, skip_special_tokens=True
+                )
+                target_encodings = self.tokenizer.base_tokenizer.encode_batch(batch_strings)
 
-                outputs = self.surrogate_model(**surrogate_batch_encodings)
-                surrogate_logits = (outputs.logits)[..., :-1, :].contiguous() # should be (batch, seq_len-1, |surr_vocab|) due to olmo's shift. their seq_len is diff though bc of different tokenizer. had to 
-                surr_batch_size, surr_seq_len, surr_vocab_size = surrogate_logits.shape #seq_len should be originnal seq_len - 1 due to shift.
+                surrogate_batch = self.surrogate_tokenizer(
+                    batch_strings,
+                    padding=True,
+                    return_offsets_mapping=True,
+                    return_tensors="pt",
+                )
+                surrogate_input_ids = surrogate_batch["input_ids"].to(self.device)
+                surrogate_attention_mask = surrogate_batch.get("attention_mask")
+                if surrogate_attention_mask is not None:
+                    surrogate_attention_mask = surrogate_attention_mask.to(self.device)
+
+                outputs = self.surrogate_model(
+                    input_ids=surrogate_input_ids,
+                    attention_mask=surrogate_attention_mask,
+                )
+                surrogate_logits = outputs.logits[..., :-1, :].contiguous()
+                surr_vocab_size = surrogate_logits.shape[-1]
 
                 #surr_perp is of size (batch, seq_ vocab). 
 
                 #we want to calculate hte perplexities across rows.  
                 surrogate_perp = torch.reciprocal(F.softmax(surrogate_logits, dim=-1) + 1e-8) # now rank using torch.topk or python sorted func. this is numerically the same. calcs per-token perplexity, not sequence.
-                labels = self.get_labels(batch) # (batch_size, seq_len -1) or (batch_size, seq_len), we will use them as indices to translate.
 
-                translated_labels = torch.full_like(labels, fill_value=-100)
-                valid_label_mask = labels != -100
-                translated_labels[valid_label_mask] = self.lookup_self_to_surrogate_tokens[labels[valid_label_mask]]
+                offset_mapping = surrogate_batch["offset_mapping"]
+                surr_attention_mask = surrogate_batch.get("attention_mask")
+                if surr_attention_mask is None:
+                    surr_attention_mask = torch.ones(offset_mapping.shape[:2], dtype=torch.long)
 
-                if labels.shape[1] != surrogate_perp.shape[1]:
-                    min_seq_len = min(labels.shape[1], surrogate_perp.shape[1])
-                    labels = labels[:, :min_seq_len]
-                    surrogate_perp = surrogate_perp[:, :min_seq_len, :]
+                labels_len = labels.shape[1]
+                alignment_indices = [[-1] * labels_len for _ in range(len(batch_strings))]
+                surr_offsets_list = offset_mapping.tolist()
+                surr_attention_list = surr_attention_mask.tolist()
+                attn_mask_list = attention_mask.tolist() if attention_mask is not None else None
 
-                lookup_self_to_surrogate_tokens = self.lookup_self_to_surrogate_tokens.to(self.device)
+                for batch_idx in range(len(batch_strings)):
+                    target_offsets = target_encodings[batch_idx].offsets
+                    valid_surrogate = []
+                    for s_idx, (s_start, s_end) in enumerate(surr_offsets_list[batch_idx]):
+                        if surr_attention_list[batch_idx][s_idx] == 0:
+                            continue
+                        if s_start == s_end:
+                            continue
+                        valid_surrogate.append((s_idx, s_start, s_end))
+
+                    target_to_surr_idx = []
+                    for t_start, t_end in target_offsets:
+                        if t_start == t_end:
+                            target_to_surr_idx.append(-1)
+                            continue
+                        best_idx = -1
+                        best_overlap = 0
+                        for s_idx, s_start, s_end in valid_surrogate:
+                            overlap = min(t_end, s_end) - max(t_start, s_start)
+                            if overlap > best_overlap:
+                                best_overlap = overlap
+                                best_idx = s_idx
+                        target_to_surr_idx.append(best_idx if best_overlap > 0 else -1)
+
+                    encoding_ids = target_encodings[batch_idx].ids
+                    row_ids = input_ids_list[batch_idx]
+                    row_attn = attn_mask_list[batch_idx] if attn_mask_list is not None else None
+                    text_positions = []
+                    pos = 0
+                    for idx, token_id in enumerate(row_ids):
+                        if row_attn is not None and row_attn[idx] == 0:
+                            continue
+                        if pos < len(encoding_ids) and token_id == encoding_ids[pos]:
+                            text_positions.append(idx)
+                            pos += 1
+                            if pos == len(encoding_ids):
+                                break
+
+                    min_len = min(len(text_positions), len(target_to_surr_idx))
+                    for i in range(min_len):
+                        surr_idx = target_to_surr_idx[i]
+                        if surr_idx <= 0:
+                            continue
+                        label_pos = text_positions[i] - 1
+                        if 0 <= label_pos < labels_len:
+                            alignment_indices[batch_idx][label_pos] = surr_idx - 1
+
+                alignment_indices = torch.tensor(alignment_indices, device=self.device, dtype=torch.long)
+                clamped_indices = alignment_indices.clamp(min=0)
+                gathered_perp = surrogate_perp.gather(
+                    dim=1,
+                    index=clamped_indices.unsqueeze(-1).expand(-1, -1, surr_vocab_size),
+                )
+                surrogate_perp = gathered_perp.masked_fill(
+                    alignment_indices.unsqueeze(-1) < 0,
+                    float("inf"),
+                )
+
+                lookup_self_to_surrogate_tokens = self.lookup_self_to_surrogate_tokens
                 safe_labels = labels.clone()
                 safe_labels[safe_labels == -100] = 0
                 translated_labels = lookup_self_to_surrogate_tokens[safe_labels]
