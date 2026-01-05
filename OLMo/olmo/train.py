@@ -153,40 +153,63 @@ try:
         else:
             ignore_index_kwarg = {"ignored_index": ignore_index}
 
-        batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
+        logits_flat = logits.view(-1, logits.shape[-1]) if logits.dim() == 3 else logits
+        labels_flat = labels.view(-1)
 
+        loss, z_loss = flash_cross_entropy_loss(
+            logits_flat,
+            labels_flat,
+            label_smoothing=0.0,
+            logit_scale=1.0,
+            lse_square_scale=z_loss_multiplier,
+            inplace_backward=False,
+            process_group=None,
+            **ignore_index_kwarg,
+        )
 
-        mask = labels != ignore_index
+        mask = labels_flat != ignore_index
 
-        if perp_indices is not None:        
-        #we use torch.gather with the perp_indices as indices (batch_size, seq_len - 1, k). We use the output logits of shape (batch_size, seq_len - 1, vocab) 
-            batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]            
-            translated_perp_indices = lookup_surrogate_to_self_tokens[perp_indices]                                                                
-            gathered_logits = torch.gather(logits, dim=2, index=translated_perp_indicies)
+        if perp_indices is not None:
+            #we use torch.gather with the perp_indices as indices (batch_size, seq_len - 1, k). We use the output logits of shape (batch_size, seq_len - 1, vocab)
+            if logits.dim() == 2:
+                batch_size, seq_len = perp_indices.shape[0], perp_indices.shape[1]
+                logits_for_gather = logits.view(batch_size, seq_len, logits.shape[-1])
+            elif logits.dim() == 3:
+                batch_size, seq_len = logits.shape[0], logits.shape[1]
+                logits_for_gather = logits
+            else:
+                raise ValueError("logits must be rank 2 or 3 when perp_indices is set")
+
+            k = (perp_indices.shape)[-1] #grabs last dim which is k.
+            translated_perp_indices = lookup_surrogate_to_self_tokens[perp_indices]
+            translated_perp_indices = translated_perp_indices.clamp(min=0)
+            gathered_logits = torch.gather(logits_for_gather, dim=2, index=translated_perp_indices)
             gathered_logit_probs = F.softmax(gathered_logits, dim=-1)
             gathered_nll = -torch.log(gathered_logit_probs + 1e-10) # (batch_len, seq_len, k)
-    
+
             isinf_bool = torch.isinf(perp_values).all(dim=-1)
-            non_included = torch.count_zeros(isinf_bool).item() * self.k
+            non_included = (~isinf_bool).sum().item() * k
             other_mask = (~isinf_bool).unsqueeze(-1)
-            
-    
-            masked_softmax_weight = F.softmax(-perp_values, dim=-1) * other_mask
-            
+
+            safe_perp_values = perp_values.clone()
+            safe_perp_values[isinf_bool] = 0
+            masked_softmax_weight = F.softmax(-safe_perp_values, dim=-1) * other_mask
+
             weighted_loss_tensor = gathered_nll * masked_softmax_weight
-            surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) 
-            
+            surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1)
+
+            loss = loss.sum() + surr_loss_term.sum()
             if reduction == "mean":
-                loss = (loss.sum() + surr_loss_term.sum()) / (mask.sum()+ (batch_size*seq_len*self.k - non_included))
+                loss /= (mask.sum() + (batch_size * seq_len * k - non_included))
             elif reduction == "sum":
-                loss = loss.sum() + surr_loss_term.sum()
+                loss = loss
             else:
                 loss = loss
 
             if not compute_z_loss:
                 return loss, None
 
-            if reduction == "mean": # i will ignore z loss for now. 
+            if reduction == "mean":
                 z_loss = z_loss.sum() / mask.sum()
             elif reduction == "sum":
                 z_loss = z_loss.sum()
@@ -798,7 +821,7 @@ class Trainer:
 
     def model_forward(
         self, batch: Dict[str, Any], loss_reduction: str = "mean", compute_z_loss: bool = False, k: int = 0
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         
 
         # shape: (batch_size, seq_len, vocab_size)
@@ -946,26 +969,45 @@ class Trainer:
         # shape: (batch_size * seq_len, vocab_size)
         logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
         # shape: (batch_size, seq_len)
-        # labels = self.get_labels(batch) #already defined labels above. 
+        # labels = self.get_labels(batch) #already defined labels above.
         # shape: (batch_size * seq_len,)
-        labels = labels.view(-1)
+        labels_flat = labels.view(-1)
+
+        base_ce_loss = None
+        if perp_indices is not None:
+            base_ce_loss = F.cross_entropy(
+                logits_for_loss, labels_flat, ignore_index=-100, reduction=loss_reduction
+            )
+
         ce_loss, z_loss = self.loss_fn(
-            logits=logits_for_loss, labels=labels, lookup_surrogate_to_self_tokens=self.lookup_surrogate_to_self_tokens, perp_values=perp_values, perp_indices=perp_indices, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
+            logits=logits_for_loss,
+            labels=labels_flat,
+            lookup_surrogate_to_self_tokens=self.lookup_surrogate_to_self_tokens,
+            perp_values=perp_values,
+            perp_indices=perp_indices,
+            ignore_index=-100,
+            reduction=loss_reduction,
+            compute_z_loss=compute_z_loss,
         )
+        if base_ce_loss is None:
+            base_ce_loss = ce_loss
         if loss_reduction == "none":
             # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
             ce_loss = ce_loss.view(batch["input_ids"].shape[0], -1)
             if z_loss is not None:
                 z_loss = z_loss.view(batch["input_ids"].shape[0], -1)
-        return ce_loss, z_loss, logits
+            if base_ce_loss is not None:
+                base_ce_loss = base_ce_loss.view(batch["input_ids"].shape[0], -1)
+        return ce_loss, z_loss, logits, base_ce_loss
 
     def train_micro_batch(
         self, micro_batch: Dict[str, Any], batch_size_in_tokens: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        ce_loss, z_loss, logits = self.model_forward(
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        ce_loss, z_loss, logits, base_ce_loss = self.model_forward(
             k=self.k, batch=micro_batch, compute_z_loss=self.cfg.softmax_auxiliary_loss, loss_reduction="sum"
         )
         ce_loss = ce_loss / batch_size_in_tokens
+        base_ce_loss = base_ce_loss / batch_size_in_tokens
 
         # In case this helps with memory utilization.
         del micro_batch
@@ -980,9 +1022,9 @@ class Trainer:
 
         del logits
 
-        return loss, ce_loss, z_loss
+        return loss, ce_loss, z_loss, base_ce_loss
 
-    def train_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def train_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         # Split into micro-batches.
         micro_batches = self.split_batch(batch)
         batch_size_in_tokens = batch["input_ids"].numel()
@@ -991,6 +1033,7 @@ class Trainer:
         del batch
 
         ce_batch_loss = torch.tensor(0.0, device=self.device)
+        base_ce_batch_loss = torch.tensor(0.0, device=self.device)
         z_batch_loss = None if not self.cfg.softmax_auxiliary_loss else torch.tensor(0.0, device=self.device)
         num_micro_batches = len(micro_batches)
 
@@ -1013,10 +1056,13 @@ class Trainer:
                 autocast_device = "mps" if self.device.type == "mps" else "cuda"
                 with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
                     # Run forward pass.
-                    loss, ce_loss, z_loss = self.train_micro_batch(micro_batch, batch_size_in_tokens)
+                    loss, ce_loss, z_loss, base_ce_loss = self.train_micro_batch(
+                        micro_batch, batch_size_in_tokens
+                    )
 
                     # Update overall CE batch loss.
                     ce_batch_loss += ce_loss.detach()
+                    base_ce_batch_loss += base_ce_loss.detach()
 
                     # Update overall Z batch loss.
                     if z_loss is not None:
@@ -1030,7 +1076,7 @@ class Trainer:
             for hook in output_hooks:
                 hook.remove()
 
-        return ce_batch_loss, z_batch_loss
+        return ce_batch_loss, z_batch_loss, base_ce_batch_loss
 
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
@@ -1051,7 +1097,7 @@ class Trainer:
         batch = move_to_device(batch, self.device)
 
         # Run forward-backward pass.
-        ce_batch_loss, z_batch_loss = self.train_batch(batch)
+        ce_batch_loss, z_batch_loss, base_ce_batch_loss = self.train_batch(batch)
 
         # Collect loss, potentially reducing over all ranks.
         if reduce_global_loss:
@@ -1060,6 +1106,8 @@ class Trainer:
             if z_batch_loss is not None:
                 dist.reduce(z_batch_loss, 0)
                 z_batch_loss.div_(get_world_size())
+            dist.reduce(base_ce_batch_loss, 0)
+            base_ce_batch_loss.div_(get_world_size())
 
         # Clip gradient norms and collect param/gradient/optim metrics.
         should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
@@ -1097,10 +1145,13 @@ class Trainer:
             raise ValueError("nan loss encountered")
         for key, value in optim_metrics.items():
             metrics[f"optim/{key}"] = value.item()
-        self.cur_train_loss = ce_batch_loss.item()
+        total_ce_loss = ce_batch_loss.item()
+        base_ce_loss = base_ce_batch_loss.item()
+        self.cur_train_loss = total_ce_loss
         self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)
-        metrics["train/CrossEntropyLoss"] = self.cur_train_loss
-        metrics["train/Perplexity"] = math.exp(self.cur_train_loss)
+        metrics["train/CrossEntropyLoss"] = base_ce_loss
+        metrics["train/CrossEntropyLossWithSurrogates"] = total_ce_loss
+        metrics["train/Perplexity"] = math.exp(base_ce_loss)
         if z_batch_loss is not None:
             metrics["train/ZLoss"] = z_batch_loss.item()
 
@@ -1116,7 +1167,7 @@ class Trainer:
 
     def eval_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
-            ce_loss, _, logits = self.model_forward(batch=batch, loss_reduction="none")
+            ce_loss, _, logits, _ = self.model_forward(batch=batch, loss_reduction="none")
         return ce_loss.mean(dim=-1), logits
 
     def eval_step(self, batch: Dict[str, Any], evaluator: Evaluator) -> None:

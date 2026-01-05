@@ -44,7 +44,6 @@ def cross_entropy_loss(
         weighted_loss_tensor = gathered_nll * masked_softmax_weight
         surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) #(batch_len, seq_len) keepdim should be false automatically.
         
-        
         logits_flat = logits.view(-1, logits.shape[-1])
         loss = surr_loss_term.sum() + F.cross_entropy(logits_flat, labels_flat, ignore_index=ignore_index, reduction="sum") #reduction='none' returns tensor with losses. shoudl be in same shape as (batch_size, seq)
         if reduction == "mean":
