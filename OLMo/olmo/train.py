@@ -153,40 +153,63 @@ try:
         else:
             ignore_index_kwarg = {"ignored_index": ignore_index}
 
-        batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]
+        logits_flat = logits.view(-1, logits.shape[-1]) if logits.dim() == 3 else logits
+        labels_flat = labels.view(-1)
 
+        loss, z_loss = flash_cross_entropy_loss(
+            logits_flat,
+            labels_flat,
+            label_smoothing=0.0,
+            logit_scale=1.0,
+            lse_square_scale=z_loss_multiplier,
+            inplace_backward=False,
+            process_group=None,
+            **ignore_index_kwarg,
+        )
 
-        mask = labels != ignore_index
+        mask = labels_flat != ignore_index
 
-        if perp_indices is not None:        
-        #we use torch.gather with the perp_indices as indices (batch_size, seq_len - 1, k). We use the output logits of shape (batch_size, seq_len - 1, vocab) 
-            batch_size, seq_len = (logits.shape)[0], (logits.shape)[1]            
-            translated_perp_indices = lookup_surrogate_to_self_tokens[perp_indices]                                                                
-            gathered_logits = torch.gather(logits, dim=2, index=translated_perp_indicies)
+        if perp_indices is not None:
+            #we use torch.gather with the perp_indices as indices (batch_size, seq_len - 1, k). We use the output logits of shape (batch_size, seq_len - 1, vocab)
+            if logits.dim() == 2:
+                batch_size, seq_len = perp_indices.shape[0], perp_indices.shape[1]
+                logits_for_gather = logits.view(batch_size, seq_len, logits.shape[-1])
+            elif logits.dim() == 3:
+                batch_size, seq_len = logits.shape[0], logits.shape[1]
+                logits_for_gather = logits
+            else:
+                raise ValueError("logits must be rank 2 or 3 when perp_indices is set")
+
+            k = (perp_indices.shape)[-1] #grabs last dim which is k.
+            translated_perp_indices = lookup_surrogate_to_self_tokens[perp_indices]
+            translated_perp_indices = translated_perp_indices.clamp(min=0)
+            gathered_logits = torch.gather(logits_for_gather, dim=2, index=translated_perp_indices)
             gathered_logit_probs = F.softmax(gathered_logits, dim=-1)
             gathered_nll = -torch.log(gathered_logit_probs + 1e-10) # (batch_len, seq_len, k)
-    
+
             isinf_bool = torch.isinf(perp_values).all(dim=-1)
-            non_included = torch.count_zeros(isinf_bool).item() * self.k
+            non_included = (~isinf_bool).sum().item() * k
             other_mask = (~isinf_bool).unsqueeze(-1)
-            
-    
-            masked_softmax_weight = F.softmax(-perp_values, dim=-1) * other_mask
-            
+
+            safe_perp_values = perp_values.clone()
+            safe_perp_values[isinf_bool] = 0
+            masked_softmax_weight = F.softmax(-safe_perp_values, dim=-1) * other_mask
+
             weighted_loss_tensor = gathered_nll * masked_softmax_weight
-            surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1) 
-            
+            surr_loss_term = torch.sum(weighted_loss_tensor, dim=-1)
+
+            loss = loss.sum() + surr_loss_term.sum()
             if reduction == "mean":
-                loss = (loss.sum() + surr_loss_term.sum()) / (mask.sum()+ (batch_size*seq_len*self.k - non_included))
+                loss /= (mask.sum() + (batch_size * seq_len * k - non_included))
             elif reduction == "sum":
-                loss = loss.sum() + surr_loss_term.sum()
+                loss = loss
             else:
                 loss = loss
 
             if not compute_z_loss:
                 return loss, None
 
-            if reduction == "mean": # i will ignore z loss for now. 
+            if reduction == "mean":
                 z_loss = z_loss.sum() / mask.sum()
             elif reduction == "sum":
                 z_loss = z_loss.sum()
@@ -296,6 +319,10 @@ class Trainer:
         self.lookup_surrogate_to_self_tokens = torch.full(size=(len(surrogate_tokenizer_token_set),), fill_value=-100, dtype=torch.long).to(self.device)
         self.lookup_surrogate_to_self_tokens[self.surr_permitted_tokens] = self.own_permitted_tokens
         self.lookup_surrogate_to_self_tokens = self.lookup_surrogate_to_self_tokens.to(self.device)
+
+        surr_vocab_size = self.surrogate_model.config.vocab_size
+        self.surr_disallowed_mask = torch.ones(surr_vocab_size, dtype=torch.bool, device=self.device)
+        self.surr_disallowed_mask[self.surr_permitted_tokens] = False
 
         # encoded_str_lens = [len(self.surrogate_tokenizer.encode(str).tokens) for str in self.tokenizer.get_vocab().keys()] 
         # max_len = max(encoded_str_lens)
@@ -798,7 +825,7 @@ class Trainer:
 
     def model_forward(
         self, batch: Dict[str, Any], loss_reduction: str = "mean", compute_z_loss: bool = False, k: int = 0
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         
 
         # shape: (batch_size, seq_len, vocab_size)
@@ -815,30 +842,106 @@ class Trainer:
         if k != 0:
             with torch.no_grad():
                 input_ids = batch["input_ids"]
-                input_ids_list = input_ids.tolist()
-                batch_strings = self.tokenizer.base_tokenizer.decode_batch(input_ids_list, skip_special_tokens=True) #skip. im sure they already have special tokens in the vocab.
-                surrogate_batch_encodings = (self.surrogate_tokenizer(batch_strings, padding=True, return_tensors='pt')).to(self.device) #padding alleviates the issue with disparate tokenization.
+                attention_mask = batch.get("attention_mask")
+                input_ids_list = batch.get("input_ids_list")
+                if input_ids_list is None:
+                    input_ids_list = input_ids.tolist()
+                batch_strings = self.tokenizer.base_tokenizer.decode_batch(
+                    input_ids_list, skip_special_tokens=True
+                )
+                target_encodings = self.tokenizer.base_tokenizer.encode_batch(batch_strings)
 
-                outputs = self.surrogate_model(**surrogate_batch_encodings)
-                surrogate_logits = (outputs.logits)[..., :-1, :].contiguous() # should be (batch, seq_len-1, |surr_vocab|) due to olmo's shift. their seq_len is diff though bc of different tokenizer. had to 
-                surr_batch_size, surr_seq_len, surr_vocab_size = surrogate_logits.shape #seq_len should be originnal seq_len - 1 due to shift.
+                surrogate_batch = self.surrogate_tokenizer(
+                    batch_strings,
+                    padding=True,
+                    return_offsets_mapping=True,
+                    return_tensors="pt",
+                )
+                surrogate_input_ids = surrogate_batch["input_ids"].to(self.device)
+                surrogate_attention_mask = surrogate_batch.get("attention_mask")
+                if surrogate_attention_mask is not None:
+                    surrogate_attention_mask = surrogate_attention_mask.to(self.device)
+
+                outputs = self.surrogate_model(
+                    input_ids=surrogate_input_ids,
+                    attention_mask=surrogate_attention_mask,
+                )
+                surrogate_logits = outputs.logits[..., :-1, :].contiguous()
+                surr_vocab_size = surrogate_logits.shape[-1]
 
                 #surr_perp is of size (batch, seq_ vocab). 
 
                 #we want to calculate hte perplexities across rows.  
                 surrogate_perp = torch.reciprocal(F.softmax(surrogate_logits, dim=-1) + 1e-8) # now rank using torch.topk or python sorted func. this is numerically the same. calcs per-token perplexity, not sequence.
-                labels = self.get_labels(batch) # (batch_size, seq_len -1) or (batch_size, seq_len), we will use them as indices to translate.
 
-                translated_labels = torch.full_like(labels, fill_value=-100)
-                valid_label_mask = labels != -100
-                translated_labels[valid_label_mask] = self.lookup_self_to_surrogate_tokens[labels[valid_label_mask]]
+                offset_mapping = surrogate_batch["offset_mapping"]
+                surr_attention_mask = surrogate_batch.get("attention_mask")
+                if surr_attention_mask is None:
+                    surr_attention_mask = torch.ones(offset_mapping.shape[:2], dtype=torch.long)
 
-                if labels.shape[1] != surrogate_perp.shape[1]:
-                    min_seq_len = min(labels.shape[1], surrogate_perp.shape[1])
-                    labels = labels[:, :min_seq_len]
-                    surrogate_perp = surrogate_perp[:, :min_seq_len, :]
+                labels_len = labels.shape[1]
+                surr_offsets = offset_mapping.to(self.device)
+                surr_attention_mask = surr_attention_mask.to(self.device)
+                target_offsets = [
+                    torch.tensor(enc.offsets, device=self.device, dtype=torch.long)
+                    for enc in target_encodings
+                ]
+                alignment_indices = torch.full(
+                    (len(batch_strings), labels_len), -1, device=self.device, dtype=torch.long
+                )
+                eos_token_id = self.tokenizer.eos_token_id
+                pad_token_id = self.tokenizer.pad_token_id
 
-                lookup_self_to_surrogate_tokens = self.lookup_self_to_surrogate_tokens.to(self.device)
+                for batch_idx in range(len(batch_strings)):
+                    t_offsets = target_offsets[batch_idx]
+                    if t_offsets.numel() == 0:
+                        continue
+                    s_offsets = surr_offsets[batch_idx]
+                    s_mask = surr_attention_mask[batch_idx] != 0
+
+                    t_start = t_offsets[:, 0].unsqueeze(1)
+                    t_end = t_offsets[:, 1].unsqueeze(1)
+                    s_start = s_offsets[:, 0].unsqueeze(0)
+                    s_end = s_offsets[:, 1].unsqueeze(0)
+                    overlap = torch.minimum(t_end, s_end) - torch.maximum(t_start, s_start)
+                    overlap = overlap.clamp(min=0)
+                    valid_s = s_mask & (s_offsets[:, 0] != s_offsets[:, 1])
+                    valid_t = t_offsets[:, 0] != t_offsets[:, 1]
+                    overlap = overlap * valid_s.unsqueeze(0).to(overlap.dtype)
+                    overlap = overlap * valid_t.unsqueeze(1).to(overlap.dtype)
+                    best_overlap, best_idx = overlap.max(dim=1)
+                    target_to_surr_idx = torch.where(
+                        best_overlap > 0, best_idx, torch.full_like(best_idx, -1)
+                    )
+
+                    row_ids = input_ids[batch_idx]
+                    if attention_mask is not None:
+                        valid_input = attention_mask[batch_idx] != 0
+                    else:
+                        valid_input = torch.ones_like(row_ids, dtype=torch.bool)
+                    if eos_token_id is not None:
+                        valid_input = valid_input & (row_ids != eos_token_id)
+                    if pad_token_id is not None:
+                        valid_input = valid_input & (row_ids != pad_token_id)
+                    text_positions = valid_input.nonzero(as_tuple=False).squeeze(1)
+                    min_len = min(text_positions.numel(), target_to_surr_idx.numel())
+                    if min_len == 0:
+                        continue
+                    surr_idx = target_to_surr_idx[:min_len]
+                    label_pos = text_positions[:min_len] - 1
+                    valid = (surr_idx > 0) & (label_pos >= 0) & (label_pos < labels_len)
+                    alignment_indices[batch_idx, label_pos[valid]] = surr_idx[valid] - 1
+                clamped_indices = alignment_indices.clamp(min=0)
+                gathered_perp = surrogate_perp.gather(
+                    dim=1,
+                    index=clamped_indices.unsqueeze(-1).expand(-1, -1, surr_vocab_size),
+                )
+                surrogate_perp = gathered_perp.masked_fill(
+                    alignment_indices.unsqueeze(-1) < 0,
+                    float("inf"),
+                )
+
+                lookup_self_to_surrogate_tokens = self.lookup_self_to_surrogate_tokens
                 safe_labels = labels.clone()
                 safe_labels[safe_labels == -100] = 0
                 translated_labels = lookup_self_to_surrogate_tokens[safe_labels]
@@ -854,9 +957,7 @@ class Trainer:
                 
                 surrogate_perp[valid_mask].scatter_(dim=-1, index=valid_indices, value=float('inf'))
                 
-                vocab_idx = torch.arange(start=0, end=surr_vocab_size, device=self.device)
-                mask = ~torch.isin(vocab_idx, self.surr_permitted_tokens) # true = not in. 
-                surrogate_perp.masked_fill_(mask, float('inf'))
+                surrogate_perp.masked_fill_(self.surr_disallowed_mask, float("inf"))
 
 
             topk = torch.topk(surrogate_perp, k=k, largest=False, sorted=True, dim=-1) # k is relative per row. might have to perform masking then topk | for now, we can just set k = to some arbitrary value. 
@@ -870,26 +971,45 @@ class Trainer:
         # shape: (batch_size * seq_len, vocab_size)
         logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
         # shape: (batch_size, seq_len)
-        # labels = self.get_labels(batch) #already defined labels above. 
+        # labels = self.get_labels(batch) #already defined labels above.
         # shape: (batch_size * seq_len,)
-        labels = labels.view(-1)
+        labels_flat = labels.view(-1)
+
+        base_ce_loss = None
+        if perp_indices is not None:
+            base_ce_loss = F.cross_entropy(
+                logits_for_loss, labels_flat, ignore_index=-100, reduction=loss_reduction
+            )
+
         ce_loss, z_loss = self.loss_fn(
-            logits=logits_for_loss, labels=labels, lookup_surrogate_to_self_tokens=self.lookup_surrogate_to_self_tokens, perp_values=perp_values, perp_indices=perp_indices, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
+            logits=logits_for_loss,
+            labels=labels_flat,
+            lookup_surrogate_to_self_tokens=self.lookup_surrogate_to_self_tokens,
+            perp_values=perp_values,
+            perp_indices=perp_indices,
+            ignore_index=-100,
+            reduction=loss_reduction,
+            compute_z_loss=compute_z_loss,
         )
+        if base_ce_loss is None:
+            base_ce_loss = ce_loss
         if loss_reduction == "none":
             # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
             ce_loss = ce_loss.view(batch["input_ids"].shape[0], -1)
             if z_loss is not None:
                 z_loss = z_loss.view(batch["input_ids"].shape[0], -1)
-        return ce_loss, z_loss, logits
+            if base_ce_loss is not None:
+                base_ce_loss = base_ce_loss.view(batch["input_ids"].shape[0], -1)
+        return ce_loss, z_loss, logits, base_ce_loss
 
     def train_micro_batch(
         self, micro_batch: Dict[str, Any], batch_size_in_tokens: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        ce_loss, z_loss, logits = self.model_forward(
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        ce_loss, z_loss, logits, base_ce_loss = self.model_forward(
             k=self.k, batch=micro_batch, compute_z_loss=self.cfg.softmax_auxiliary_loss, loss_reduction="sum"
         )
         ce_loss = ce_loss / batch_size_in_tokens
+        base_ce_loss = base_ce_loss / batch_size_in_tokens
 
         # In case this helps with memory utilization.
         del micro_batch
@@ -904,9 +1024,9 @@ class Trainer:
 
         del logits
 
-        return loss, ce_loss, z_loss
+        return loss, ce_loss, z_loss, base_ce_loss
 
-    def train_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def train_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         # Split into micro-batches.
         micro_batches = self.split_batch(batch)
         batch_size_in_tokens = batch["input_ids"].numel()
@@ -915,6 +1035,7 @@ class Trainer:
         del batch
 
         ce_batch_loss = torch.tensor(0.0, device=self.device)
+        base_ce_batch_loss = torch.tensor(0.0, device=self.device)
         z_batch_loss = None if not self.cfg.softmax_auxiliary_loss else torch.tensor(0.0, device=self.device)
         num_micro_batches = len(micro_batches)
 
@@ -937,10 +1058,13 @@ class Trainer:
                 autocast_device = "mps" if self.device.type == "mps" else "cuda"
                 with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
                     # Run forward pass.
-                    loss, ce_loss, z_loss = self.train_micro_batch(micro_batch, batch_size_in_tokens)
+                    loss, ce_loss, z_loss, base_ce_loss = self.train_micro_batch(
+                        micro_batch, batch_size_in_tokens
+                    )
 
                     # Update overall CE batch loss.
                     ce_batch_loss += ce_loss.detach()
+                    base_ce_batch_loss += base_ce_loss.detach()
 
                     # Update overall Z batch loss.
                     if z_loss is not None:
@@ -954,7 +1078,7 @@ class Trainer:
             for hook in output_hooks:
                 hook.remove()
 
-        return ce_batch_loss, z_batch_loss
+        return ce_batch_loss, z_batch_loss, base_ce_batch_loss
 
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
@@ -972,10 +1096,14 @@ class Trainer:
         self.optim.zero_grad(set_to_none=True)
 
         # Move tensors to the right device.
+        if self.k != 0 and "input_ids_list" not in batch:
+            input_ids = batch.get("input_ids")
+            if isinstance(input_ids, torch.Tensor):
+                batch["input_ids_list"] = input_ids.tolist()
         batch = move_to_device(batch, self.device)
 
         # Run forward-backward pass.
-        ce_batch_loss, z_batch_loss = self.train_batch(batch)
+        ce_batch_loss, z_batch_loss, base_ce_batch_loss = self.train_batch(batch)
 
         # Collect loss, potentially reducing over all ranks.
         if reduce_global_loss:
@@ -984,6 +1112,8 @@ class Trainer:
             if z_batch_loss is not None:
                 dist.reduce(z_batch_loss, 0)
                 z_batch_loss.div_(get_world_size())
+            dist.reduce(base_ce_batch_loss, 0)
+            base_ce_batch_loss.div_(get_world_size())
 
         # Clip gradient norms and collect param/gradient/optim metrics.
         should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
@@ -1021,10 +1151,13 @@ class Trainer:
             raise ValueError("nan loss encountered")
         for key, value in optim_metrics.items():
             metrics[f"optim/{key}"] = value.item()
-        self.cur_train_loss = ce_batch_loss.item()
+        total_ce_loss = ce_batch_loss.item()
+        base_ce_loss = base_ce_batch_loss.item()
+        self.cur_train_loss = total_ce_loss
         self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)
-        metrics["train/CrossEntropyLoss"] = self.cur_train_loss
-        metrics["train/Perplexity"] = math.exp(self.cur_train_loss)
+        metrics["train/CrossEntropyLoss"] = base_ce_loss
+        metrics["train/CrossEntropyLossWithSurrogates"] = total_ce_loss
+        metrics["train/Perplexity"] = math.exp(base_ce_loss)
         if z_batch_loss is not None:
             metrics["train/ZLoss"] = z_batch_loss.item()
 
@@ -1040,7 +1173,7 @@ class Trainer:
 
     def eval_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
-            ce_loss, _, logits = self.model_forward(batch=batch, loss_reduction="none")
+            ce_loss, _, logits, _ = self.model_forward(batch=batch, loss_reduction="none")
         return ce_loss.mean(dim=-1), logits
 
     def eval_step(self, batch: Dict[str, Any], evaluator: Evaluator) -> None:
